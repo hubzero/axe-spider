@@ -391,6 +391,14 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, level=None,
                     page_count -= 1
                     continue
 
+                # Skip non-HTML responses (JSON/XML endpoints that Chrome wraps)
+                page_start = driver.execute_script(
+                    "return document.documentElement.outerHTML.substring(0, 80);") or ''
+                if page_start and '<html' not in page_start.lower():
+                    print("  SKIP: non-HTML response")
+                    page_count -= 1
+                    continue
+
                 results = run_axe(driver, axe_source, tags)
 
                 if 'error' in results:

@@ -780,6 +780,16 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
             pass  # not on Linux or no permission — harmless
 
     page_wait = _safe_int(config.get('page_wait', 1), 1)
+
+    # Respect robots.txt Crawl-delay if it's longer than our configured wait.
+    # This prevents us from hitting the server faster than the site owner allows.
+    if robots_parser is not None:
+        crawl_delay = robots_parser.crawl_delay('axe-spider')
+        if crawl_delay is not None and crawl_delay > page_wait:
+            if not quiet:
+                print("Robots.txt crawl-delay: {}s (overrides page_wait: {}s)".format(
+                    crawl_delay, page_wait))
+            page_wait = int(crawl_delay)
     axe_source = load_axe_source()
     driver = create_browser(config)
     base_url = start_url

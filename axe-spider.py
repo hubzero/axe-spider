@@ -399,7 +399,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                    include_paths=None, exclude_paths=None, exclude_regex=None,
                    exclude_query=None, verbose=False, config=None,
                    json_path=None, html_path=None, save_every=25,
-                   level_label=None, allowlist=None):
+                   level_label=None, allowlist=None, seed_urls=None):
     """Crawl the site starting from start_url and scan each page with axe-core.
 
     If json_path is provided, results are flushed to disk every `save_every`
@@ -446,7 +446,12 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
     base_url = start_url
 
     visited = set()
-    queue = [normalize_url(start_url)]
+    if seed_urls:
+        queue = [normalize_url(u) for u in seed_urls]
+        no_crawl = True  # Don't follow links when using a URL list
+    else:
+        queue = [normalize_url(start_url)]
+        no_crawl = False
     page_count = 0
 
     # Stream results to a JSONL file (one JSON object per line) instead of
@@ -605,8 +610,8 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                 }
                 _write_page(url, page_data)
 
-                # Don't follow links from error pages
-                if not status or status < 400:
+                # Don't follow links from error pages or when using a URL list
+                if not no_crawl and (not status or status < 400):
                     new_links = extract_links(driver, base_url)
                     for link in new_links:
                         if link not in visited and link not in queue:
@@ -1199,6 +1204,8 @@ def main():
                              'Partial results survive if the scan is killed.')
     parser.add_argument('--diff', default=None, metavar='PREV.jsonl',
                         help='Compare against a previous scan JSONL and show what changed')
+    parser.add_argument('--urls', default=None, metavar='FILE',
+                        help='Scan URLs from a file (one per line) instead of crawling')
     parser.add_argument('--rule', action='append', default=None,
                         help='Only run specific axe rules (repeatable, e.g. --rule color-contrast)')
     parser.add_argument('--url-only', action='store_true',
@@ -1230,9 +1237,21 @@ def main():
     level_info = WCAG_LEVELS.get(level, {})
     level_label = level_info.get('label', 'Custom') if not args.tags else 'Custom tags'
 
+    # Load URL list from file
+    seed_urls = None
+    if args.urls:
+        with open(args.urls) as f:
+            seed_urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        if not seed_urls:
+            parser.error('No URLs found in {}'.format(args.urls))
+        if not url:
+            url = seed_urls[0]
+
     # Resolve max pages
     if args.url_only:
         max_pages = 1
+    elif seed_urls:
+        max_pages = len(seed_urls)
     else:
         max_pages = args.max_pages or int(config.get('max_pages', 50))
 
@@ -1289,6 +1308,7 @@ def main():
         save_every=save_every,
         level_label=level_label,
         allowlist=allowlist,
+        seed_urls=seed_urls,
     )
 
     # Final reports already flushed by crawl_and_scan

@@ -1200,6 +1200,8 @@ def main():
                         help='Scan only the given URL (no crawling). Fast single-page verify.')
     parser.add_argument('--llm', action='store_true',
                         help='Generate a compact markdown summary optimized for LLM context')
+    parser.add_argument('--summary-json', action='store_true',
+                        help='Print a one-line JSON summary to stdout (machine-parseable)')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Verbose output')
 
@@ -1300,9 +1302,26 @@ def main():
         for _, data in _iter_jsonl(jsonl_path):
             total_violations += sum(len(v.get('nodes', [])) for v in data.get('violations', []))
             total_incomplete += sum(len(v.get('nodes', [])) for v in data.get('incomplete', []))
+    # Collect unique rule IDs for summary
+    violation_rules = set()
+    if jsonl_path and os.path.exists(jsonl_path):
+        for _, data in _iter_jsonl(jsonl_path):
+            for v in data.get('violations', []):
+                violation_rules.add(v.get('id', ''))
+
     print("\nScan complete: {} pages scanned".format(scanned))
     print("  Violations: {} node(s) failing WCAG rules".format(total_violations))
     print("  Incomplete: {} node(s) needing manual review".format(total_incomplete))
+
+    if args.summary_json:
+        summary = {
+            'pages': scanned,
+            'violations': total_violations,
+            'incomplete': total_incomplete,
+            'rules': sorted(violation_rules),
+            'clean': total_violations == 0,
+        }
+        print(json.dumps(summary))
 
     # Diff against previous scan
     if args.diff and jsonl_path and os.path.exists(jsonl_path):

@@ -71,17 +71,45 @@ AXE_VERSION = None
 
 # WCAG level presets: maps a level name to the axe-core tags to run
 WCAG_LEVELS = {
-    'wcag2a':    {'tags': ['wcag2a'],                                                        'label': 'WCAG 2.0 Level A'},
-    'wcag2aa':   {'tags': ['wcag2a', 'wcag2aa'],                                             'label': 'WCAG 2.0 Level AA'},
-    'wcag2aaa':  {'tags': ['wcag2a', 'wcag2aa', 'wcag2aaa'],                                 'label': 'WCAG 2.0 Level AAA'},
-    'wcag21a':   {'tags': ['wcag2a', 'wcag21a'],                                             'label': 'WCAG 2.1 Level A'},
-    'wcag21aa':  {'tags': ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'],                      'label': 'WCAG 2.1 Level AA'},
-    'wcag21aaa': {'tags': ['wcag2a', 'wcag2aa', 'wcag2aaa', 'wcag21a', 'wcag21aa', 'wcag21aaa'],
-                                                                                              'label': 'WCAG 2.1 Level AAA'},
-    'wcag22a':   {'tags': ['wcag2a', 'wcag21a', 'wcag22a'],                                  'label': 'WCAG 2.2 Level A'},
-    'wcag22aa':  {'tags': ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'],          'label': 'WCAG 2.2 Level AA'},
-    'wcag22aaa': {'tags': ['wcag2a', 'wcag2aa', 'wcag2aaa', 'wcag21a', 'wcag21aa', 'wcag21aaa',
-                           'wcag22aa', 'wcag22aaa'],                                          'label': 'WCAG 2.2 Level AAA'},
+    'wcag2a': {
+        'tags': ['wcag2a'],
+        'label': 'WCAG 2.0 Level A',
+    },
+    'wcag2aa': {
+        'tags': ['wcag2a', 'wcag2aa'],
+        'label': 'WCAG 2.0 Level AA',
+    },
+    'wcag2aaa': {
+        'tags': ['wcag2a', 'wcag2aa', 'wcag2aaa'],
+        'label': 'WCAG 2.0 Level AAA',
+    },
+    'wcag21a': {
+        'tags': ['wcag2a', 'wcag21a'],
+        'label': 'WCAG 2.1 Level A',
+    },
+    'wcag21aa': {
+        'tags': ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'],
+        'label': 'WCAG 2.1 Level AA',
+    },
+    'wcag21aaa': {
+        'tags': ['wcag2a', 'wcag2aa', 'wcag2aaa',
+                 'wcag21a', 'wcag21aa', 'wcag21aaa'],
+        'label': 'WCAG 2.1 Level AAA',
+    },
+    'wcag22a': {
+        'tags': ['wcag2a', 'wcag21a', 'wcag22a'],
+        'label': 'WCAG 2.2 Level A',
+    },
+    'wcag22aa': {
+        'tags': ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'],
+        'label': 'WCAG 2.2 Level AA',
+    },
+    'wcag22aaa': {
+        'tags': ['wcag2a', 'wcag2aa', 'wcag2aaa',
+                 'wcag21a', 'wcag21aa', 'wcag21aaa',
+                 'wcag22aa', 'wcag22aaa'],
+        'label': 'WCAG 2.2 Level AAA',
+    },
 }
 DEFAULT_LEVEL = 'wcag21aa'
 
@@ -443,7 +471,7 @@ def extract_links(driver, base_url):
             ".map(a => a.href)"
             ".filter(h => h.startsWith('http'))"
         )
-        return [normalize_url(l) for l in links if l]
+        return [normalize_url(link) for link in links if link]
     except Exception:
         return []
 
@@ -603,6 +631,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
 
     # SIGTERM/SIGINT handler: flush partial results, quit driver, exit
     interrupted = False
+
     def _on_signal(signum, frame):
         nonlocal interrupted
         if interrupted:
@@ -1101,7 +1130,7 @@ def _render_nodes_html(nodes, limit=20, snippet_max=500):
 
 
 def generate_llm_report(jsonl_path, output_path, start_url,
-                           level_label='WCAG 2.1 Level AA', allowlist=None):
+                        level_label='WCAG 2.1 Level AA', allowlist=None):
     """Generate a token-efficient markdown summary optimized for LLMs.
 
     Instead of dumping raw JSON (100K+ tokens for a large scan), this
@@ -1192,8 +1221,9 @@ def generate_llm_report(jsonl_path, output_path, start_url,
         lines.append('## Violations ({} issues on {} pages)\n'.format(
             sum(v['count'] for v in violations_by_rule.values()),
             len(pages_with_violations)))
-        for rule_id, info in sorted(violations_by_rule.items(),
-                                     key=lambda x: x[1]['count'], reverse=True):
+        for rule_id, info in sorted(
+                violations_by_rule.items(),
+                key=lambda x: x[1]['count'], reverse=True):
             wcag_scs = ', '.join(sorted(_parse_wcag_sc(info['tags'])))
             lines.append('### {} ({}, {} issues)'.format(rule_id, info['impact'], info['count']))
             lines.append('{}'.format(info['help']))
@@ -1214,8 +1244,9 @@ def generate_llm_report(jsonl_path, output_path, start_url,
         total_inc = sum(v['count'] for v in incompletes_by_key.values())
         lines.append('## Incompletes ({} nodes on {} pages)\n'.format(
             total_inc, len(pages_with_incompletes)))
-        for mk, info in sorted(incompletes_by_key.items(),
-                                key=lambda x: x[1]['count'], reverse=True):
+        for mk, info in sorted(
+                incompletes_by_key.items(),
+                key=lambda x: x[1]['count'], reverse=True):
             lines.append('### {} — {} nodes, {} pages'.format(
                 mk or '(unknown)', info['count'], len(info['pages'])))
             pages_list = sorted(info['pages'])

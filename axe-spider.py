@@ -1116,6 +1116,52 @@ def generate_llm_report(jsonl_path, output_path, start_url,
     return report
 
 
+def diff_scans(old_jsonl, new_jsonl, allowlist=None):
+    """Compare two scans and print what changed.
+
+    Returns (fixed_count, new_count) violation nodes.
+    """
+    allowlist = allowlist or []
+
+    def _violation_keys(jsonl_path):
+        """Return {(url_path, rule_id): node_count} for violations."""
+        keys = {}
+        for url, data in _iter_jsonl(jsonl_path):
+            path = urlparse(url).path
+            for v in data.get('violations', []):
+                key = (path, v.get('id', ''))
+                keys[key] = keys.get(key, 0) + len(v.get('nodes', []))
+        return keys
+
+    old = _violation_keys(old_jsonl)
+    new = _violation_keys(new_jsonl)
+
+    fixed = {k: v for k, v in old.items() if k not in new}
+    added = {k: v for k, v in new.items() if k not in old}
+    remaining = {k: v for k, v in new.items() if k in old}
+
+    if fixed:
+        print("\n  FIXED ({} rule/page combos, {} nodes):".format(
+            len(fixed), sum(fixed.values())))
+        for (path, rule), count in sorted(fixed.items()):
+            print("    - {} on {} ({} nodes)".format(rule, path, count))
+
+    if added:
+        print("\n  NEW ({} rule/page combos, {} nodes):".format(
+            len(added), sum(added.values())))
+        for (path, rule), count in sorted(added.items()):
+            print("    + {} on {} ({} nodes)".format(rule, path, count))
+
+    if remaining:
+        print("\n  REMAINING ({} rule/page combos, {} nodes)".format(
+            len(remaining), sum(remaining.values())))
+
+    if not fixed and not added:
+        print("\n  No changes in violations.")
+
+    return sum(fixed.values()), sum(added.values())
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Scan a website for WCAG accessibility violations using axe-core.',
@@ -1148,6 +1194,8 @@ def main():
     parser.add_argument('--save-every', type=int, default=None,
                         help='Flush reports every N pages (default: 25). '
                              'Partial results survive if the scan is killed.')
+    parser.add_argument('--diff', default=None, metavar='PREV.jsonl',
+                        help='Compare against a previous scan JSONL and show what changed')
     parser.add_argument('--url-only', action='store_true',
                         help='Scan only the given URL (no crawling). Fast single-page verify.')
     parser.add_argument('--llm', action='store_true',
@@ -1256,7 +1304,15 @@ def main():
     print("  Violations: {} node(s) failing WCAG rules".format(total_violations))
     print("  Incomplete: {} node(s) needing manual review".format(total_incomplete))
 
-    # Exit code: 0 = clean, 1 = violations found, 2 = scan error
+    # Diff against previous scan
+    if args.diff and jsonl_path and os.path.exists(jsonl_path):
+        if os.path.exists(args.diff):
+            print("\nDiff vs {}:".format(args.diff))
+            diff_scans(args.diff, jsonl_path, allowlist=allowlist)
+        else:
+            print("\nWARNING: diff file not found: {}".format(args.diff))
+
+    # Exit code: 0 = clean, 1 = violations found
     if total_violations > 0:
         sys.exit(1)
 

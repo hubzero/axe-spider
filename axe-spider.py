@@ -1125,10 +1125,13 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                             str(page_count).rjust(page_width), max_pages,
                             url, status_str, elapsed))
                         if verbose:
-                            print("  Violations: {} ({} nodes), Incomplete: {} ({} nodes), Queue: {}".format(
-                                len(page_data['violations']), v_count,
-                                len(page_data['incomplete']), i_count,
-                                len(queue)))
+                            print(
+                                "  V: {} ({} nodes), I: {} ({} nodes),"
+                                " Queue: {}".format(
+                                    len(page_data['violations']),
+                                    v_count,
+                                    len(page_data['incomplete']),
+                                    i_count, len(queue)))
 
                     _write_page(url, page_data)
 
@@ -1372,6 +1375,14 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                         str(page_count).rjust(pw_w),
                                         max_pages, wid, url, ss,
                                         elapsed))
+                                    if verbose:
+                                        print(
+                                            "  V: {} ({} nodes), I: {} ({} nodes),"
+                                            " Queue: {}".format(
+                                                len(page_data.get('violations', [])),
+                                                v_count,
+                                                len(page_data.get('incomplete', [])),
+                                                i_count, len(queue)))
                                 _write_page(url, page_data)
 
                                 for link in new_links:
@@ -1465,6 +1476,14 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                     print("[{}/{}] {} — {} ({:.1f}s)".format(
                                         str(page_count).rjust(pw),
                                         max_pages, url, ss, elapsed))
+                                    if verbose:
+                                        print(
+                                            "  V: {} ({} nodes), I: {} ({} nodes),"
+                                            " Queue: {}".format(
+                                                len(page_data.get('violations', [])),
+                                                v_count,
+                                                len(page_data.get('incomplete', [])),
+                                                i_count, len(queue)))
 
                             with write_lock:
                                 _write_page(url, page_data)

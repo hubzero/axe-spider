@@ -750,8 +750,6 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                 continue
 
             page_count += 1
-            if not quiet:
-                print("[{}/{}] Scanning: {}".format(page_count, max_pages, url))
 
             # Pre-check the HTTP status with a lightweight HEAD request before
             # launching the full Chromium page load.  We still scan error pages
@@ -760,8 +758,9 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
             # nav chrome, and following those links would cause the crawler to
             # fan out from dead URLs and waste time on unrelated pages.
             status = http_status(url)
-            if status and status >= 400 and not quiet:
-                print("  HTTP {} (error page — scan but skip links)".format(status))
+            if not quiet and verbose and status and status >= 400:
+                print("[{}/{}] HTTP {} on {}".format(
+                    page_count, max_pages, status, url))
 
             try:
                 driver.get(url)
@@ -826,9 +825,22 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
 
                 v_count = _count_nodes(violations)
                 i_count = _count_nodes(incomplete)
+
+                # Default: compact one-line progress.  -v: detailed breakdown.
                 if not quiet:
-                    print("  Violations: {} ({} issues), Incomplete: {} ({} nodes), Passes: {}".format(
-                        len(violations), v_count, len(incomplete), i_count, len(passes)))
+                    page_width = len(str(max_pages))
+                    status_parts = []
+                    if v_count:
+                        status_parts.append('{} violations'.format(v_count))
+                    if i_count:
+                        status_parts.append('{} incomplete'.format(i_count))
+                    status_str = ', '.join(status_parts) if status_parts else 'clean'
+                    print("[{}/{}] {} — {}".format(
+                        str(page_count).rjust(page_width), max_pages,
+                        url, status_str))
+                    if verbose and (v_count or i_count):
+                        print("  Violations: {} ({} nodes), Incomplete: {} ({} nodes), Passes: {}".format(
+                            len(violations), v_count, len(incomplete), i_count, len(passes)))
 
                 page_data = {
                     'url': url,

@@ -1418,18 +1418,36 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                             _make_staggered(url, i * stagger, wid)())
                         pending[task] = url
 
+                    # Track which worker IDs are in use so we can
+                    # show which worker produced each result.
+                    # task_workers maps task -> worker_id
+                    task_workers = {}
+                    for task, url in pending.items():
+                        task_workers[task] = 1  # initial task is W1
+                    active_wids = {1}
+
+                    def _free_wid():
+                        """Return the lowest available worker ID."""
+                        for w in range(1, num_workers + 1):
+                            if w not in active_wids:
+                                return w
+                        return num_workers  # shouldn't happen
+
                     # Sliding window: as each finishes, print result,
-                    # feed discovered links, and fill all empty worker
-                    # slots (not just one).  This is important because
-                    # with a single seed URL, only W1 gets the first
-                    # page; W2/W3 can't start until W1 discovers links.
+                    # feed discovered links, fill empty worker slots.
                     while pending and not interrupted:
                         done, _ = await asyncio.wait(
                             pending.keys(),
                             return_when=asyncio.FIRST_COMPLETED)
 
+                        # Collect freed worker IDs from completed tasks
+                        freed_wids = []
                         for task in done:
                             del pending[task]
+                            wid = task_workers.pop(task, 0)
+                            active_wids.discard(wid)
+                            freed_wids.append(wid)
+
                             page_count += 1
                             result = None
                             try:
@@ -1438,7 +1456,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                 pass
 
                             if result is not None:
-                                url, page_data, new_links, wid = result
+                                url, page_data, new_links, _ = result
                                 v_count = _count_nodes(
                                     page_data.get('violations', []))
                                 i_count = _count_nodes(
@@ -1461,7 +1479,6 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                         max_pages, wid, url, ss))
                                 _write_page(url, page_data)
 
-                                # Feed discovered links into the queue
                                 for link in new_links:
                                     if (link not in visited
                                             and link not in queue):
@@ -1469,19 +1486,22 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                             else:
                                 page_count -= 1
 
-                        # Fill ALL empty worker slots (not just one).
-                        # After the first page finishes and feeds links,
-                        # this is what gets W2/W3 their first pages.
-                        # Worker IDs cycle 1..num_workers.
+                        # Fill empty slots with freed worker IDs first,
+                        # then allocate new ones if needed.
                         while (len(pending) < num_workers
                                and page_count + len(pending) < max_pages):
                             next_url = _next_url()
                             if next_url is None:
                                 break
-                            wid = (len(pending) % num_workers) + 1
+                            if freed_wids:
+                                wid = freed_wids.pop(0)
+                            else:
+                                wid = _free_wid()
+                            active_wids.add(wid)
                             t = asyncio.create_task(
                                 _scan(next_url, worker_id=wid))
                             pending[t] = next_url
+                            task_workers[t] = wid
 
                         if (json_path and save_every
                                 and page_count % save_every == 0):

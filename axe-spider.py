@@ -40,6 +40,7 @@ import urllib.error
 from collections import deque
 from datetime import datetime
 from urllib.parse import urlparse, urlunparse
+from urllib.robotparser import RobotFileParser
 
 # Selenium is the only external dependency.  We catch ImportError here
 # rather than letting Python's traceback confuse users who haven't installed it.
@@ -432,8 +433,25 @@ def is_same_origin(url, base_url):
     return urlparse(url).netloc == urlparse(base_url).netloc
 
 
+def load_robots_txt(base_url):
+    """Fetch and parse the site's robots.txt.
+
+    Returns a RobotFileParser that can check whether a URL is allowed.
+    Returns None if robots.txt can't be fetched (we'll allow everything).
+    """
+    parsed = urlparse(base_url)
+    robots_url = '{}://{}/robots.txt'.format(parsed.scheme, parsed.netloc)
+    parser = RobotFileParser()
+    parser.set_url(robots_url)
+    try:
+        parser.read()
+        return parser
+    except Exception:
+        return None
+
+
 def should_scan(url, base_url, include_paths, exclude_paths, exclude_regex=None,
-                exclude_query=None):
+                exclude_query=None, robots_parser=None):
     if not is_same_origin(url, base_url):
         return False
     parsed = urlparse(url)
@@ -465,6 +483,18 @@ def should_scan(url, base_url, include_paths, exclude_paths, exclude_regex=None,
         for q in exclude_query:
             if q in query:
                 return False
+
+    # Respect robots.txt if a parser was provided (--ignore-robots disables this).
+    # We check both the exact URL and with a trailing slash, because our URL
+    # normalizer strips trailing slashes but robots.txt Disallow patterns
+    # often include them (e.g. "Disallow: /tools/" blocks /tools/ but
+    # technically not /tools without the slash).
+    if robots_parser is not None:
+        if not robots_parser.can_fetch('axe-spider', url):
+            return False
+        url_with_slash = url.rstrip('/') + '/'
+        if not robots_parser.can_fetch('axe-spider', url_with_slash):
+            return False
 
     return True
 
@@ -565,7 +595,8 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                    include_paths=None, exclude_paths=None, exclude_regex=None,
                    exclude_query=None, verbose=False, quiet=False, config=None,
                    json_path=None, html_path=None, save_every=25,
-                   level_label=None, allowlist=None, seed_urls=None):
+                   level_label=None, allowlist=None, seed_urls=None,
+                   robots_parser=None):
     """Crawl the site starting from start_url and scan each page with axe-core.
 
     If json_path is provided, results are flushed to disk every `save_every`
@@ -714,7 +745,8 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                 continue
             visited.add(url)
 
-            if not should_scan(url, base_url, include_paths, exclude_paths, exclude_regex, exclude_query):
+            if not should_scan(url, base_url, include_paths, exclude_paths,
+                               exclude_regex, exclude_query, robots_parser):
                 continue
 
             page_count += 1
@@ -1412,6 +1444,8 @@ def main():
                         help='Skip URLs starting with this prefix (repeatable, adds to config)')
     parser.add_argument('--no-default-excludes', action='store_true',
                         help='Ignore exclude_paths from config file')
+    parser.add_argument('--ignore-robots', action='store_true',
+                        help='Ignore robots.txt (by default, disallowed paths are skipped)')
     parser.add_argument('--output', default=None,
                         help='Output file basename (default: axe-spider-YYYY-MM-DD-HHMMSS)')
     parser.add_argument('--output-dir', default=None,
@@ -1607,6 +1641,17 @@ KEY FLAGS FOR LLM WORKFLOWS
     if allowlist:
         print("Allowlist: {} entries from {}".format(len(allowlist), allowlist_path))
 
+    # Load robots.txt unless told to ignore it.
+    # By default we respect robots.txt — it's polite and often excludes
+    # the same paths we'd want to skip anyway (admin, API, login, etc.).
+    ignore_robots = args.ignore_robots or config.get('ignore_robots') in (
+        True, 'true', 'yes', '1')
+    robots_parser = None
+    if not ignore_robots:
+        robots_parser = load_robots_txt(url)
+        if robots_parser and not args.quiet:
+            print("Respecting robots.txt (use --ignore-robots to override)")
+
     html_path = os.path.join(output_dir, basename + '.html')
     json_path = os.path.join(output_dir, basename + '.json')
 
@@ -1629,6 +1674,7 @@ KEY FLAGS FOR LLM WORKFLOWS
         level_label=level_label,
         allowlist=allowlist,
         seed_urls=seed_urls,
+        robots_parser=robots_parser,
     )
 
     # Final reports already flushed by crawl_and_scan

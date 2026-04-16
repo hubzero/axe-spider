@@ -49,6 +49,9 @@ oom_score_adj: 1000
 # Allowlist of known-acceptable incompletes (see allowlist.yaml.example)
 # allowlist: allowlist.yaml
 
+# Ignore robots.txt restrictions (default: obey robots.txt)
+# ignore_robots: true
+
 # Ignore TLS certificate errors (for self-signed internal sites)
 # ignore_certificate_errors: true
 

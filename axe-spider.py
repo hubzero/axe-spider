@@ -1251,6 +1251,10 @@ def main():
     print("  Violations: {} node(s) failing WCAG rules".format(total_violations))
     print("  Incomplete: {} node(s) needing manual review".format(total_incomplete))
 
+    # Exit code: 0 = clean, 1 = violations found, 2 = scan error
+    if total_violations > 0:
+        sys.exit(1)
+
 
 if __name__ == '__main__':
     main()

@@ -135,8 +135,13 @@ def create_driver(config=None):
     opts.add_experimental_option('prefs', prefs)
 
     chromedriver = config.get('chromedriver_path', '/usr/bin/chromedriver')
-    driver = webdriver.Chrome(executable_path=chromedriver, options=opts)
+    try:
+        from selenium.webdriver.chrome.service import Service
+        driver = webdriver.Chrome(service=Service(chromedriver), options=opts)
+    except (ImportError, TypeError):
+        driver = webdriver.Chrome(executable_path=chromedriver, options=opts)
     driver.set_page_load_timeout(30)
+    driver.set_script_timeout(120)
     driver.implicitly_wait(5)
     return driver
 
@@ -268,8 +273,10 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, level=None,
                 driver.get(url)
                 time.sleep(page_wait)
 
-                if not is_same_origin(driver.current_url, start_url):
-                    print("  SKIP: redirected off-origin to {}".format(driver.current_url))
+                current = driver.current_url
+                if not is_same_origin(current, base_url):
+                    print("  REDIRECTED to {}, skipping".format(current[:80]))
+                    page_count -= 1  # Don't count external redirects
                     continue
 
                 results = run_axe(driver, axe_source, tags)
@@ -283,9 +290,9 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, level=None,
                 passes = results.get('passes', [])
 
                 v_count = sum(len(v.get('nodes', [])) for v in violations)
-                print("  Violations: {} ({} issues), Incomplete: {}, Passes: {}".format(
-                    len(violations), v_count, len(incomplete), len(passes)
-                ))
+                i_count = sum(len(v.get('nodes', [])) for v in incomplete)
+                print("  Violations: {} ({} issues), Incomplete: {} ({} nodes), Passes: {}".format(
+                    len(violations), v_count, len(incomplete), i_count, len(passes)))
 
                 all_results[url] = {
                     'url': url,
@@ -322,9 +329,10 @@ def generate_html_report(all_results, output_path, start_url, level_label='WCAG 
     total_pages = len(all_results)
     total_violations = 0
     total_violation_nodes = 0
-    total_incomplete = 0
+    total_incomplete_nodes = 0
     impact_counts = {'critical': 0, 'serious': 0, 'moderate': 0, 'minor': 0}
     rule_summary = {}
+    incomplete_summary = {}
 
     for url, data in all_results.items():
         for v in data.get('violations', []):
@@ -348,9 +356,23 @@ def generate_html_report(all_results, output_path, start_url, level_label='WCAG 
             rule_summary[rule_id]['count'] += len(nodes)
             rule_summary[rule_id]['pages'].append(url)
 
-        total_incomplete += len(data.get('incomplete', []))
+        for v in data.get('incomplete', []):
+            nodes = v.get('nodes', [])
+            total_incomplete_nodes += len(nodes)
+            rule_id = v.get('id', 'unknown')
+            if rule_id not in incomplete_summary:
+                incomplete_summary[rule_id] = {
+                    'help': v.get('help', ''),
+                    'helpUrl': v.get('helpUrl', ''),
+                    'impact': v.get('impact', 'unknown'),
+                    'count': 0,
+                    'pages': [],
+                }
+            incomplete_summary[rule_id]['count'] += len(nodes)
+            incomplete_summary[rule_id]['pages'].append(url)
 
     sorted_rules = sorted(rule_summary.items(), key=lambda x: x[1]['count'], reverse=True)
+    sorted_incomplete = sorted(incomplete_summary.items(), key=lambda x: x[1]['count'], reverse=True)
 
     impact_colors = {
         'critical': '#d32f2f',
@@ -430,7 +452,7 @@ def generate_html_report(all_results, output_path, start_url, level_label='WCAG 
         '<div class="label">Unique Rules</div></div>'.format(len(rule_summary)))
     html_parts.append(
         '<div class="summary-card"><div class="number">{}</div>'
-        '<div class="label">Needs Review</div></div>'.format(total_incomplete))
+        '<div class="label">Needs Review</div></div>'.format(total_incomplete_nodes))
     html_parts.append('</div>')
 
     html_parts.append('<h2>Impact Breakdown</h2>')
@@ -461,18 +483,37 @@ def generate_html_report(all_results, output_path, start_url, level_label='WCAG 
                     desc=_esc(info['help'])))
         html_parts.append('</table>')
 
+    # Incomplete summary table
+    if sorted_incomplete:
+        html_parts.append('<h2>Incomplete Summary (Needs Manual Review)</h2>')
+        html_parts.append('<p class="meta">axe-core could not automatically determine '
+                          'pass/fail for these items — typically color-contrast on elements '
+                          'with background images, gradients, or pseudo-elements.</p>')
+        html_parts.append('<table><tr><th>Rule</th><th>Nodes</th>'
+                          '<th>Pages</th><th>Description</th></tr>')
+        for rule_id, info in sorted_incomplete:
+            html_parts.append(
+                '<tr><td><a href="{url}">{id}</a></td>'
+                '<td>{count}</td><td>{pages}</td><td>{desc}</td></tr>'.format(
+                    url=_esc(info['helpUrl']), id=_esc(rule_id),
+                    count=info['count'], pages=len(set(info['pages'])),
+                    desc=_esc(info['help'])))
+        html_parts.append('</table>')
+
     html_parts.append('<h2>Per-Page Details</h2>')
     for url, data in all_results.items():
         violations = data.get('violations', [])
-        if not violations:
+        incomplete = data.get('incomplete', [])
+        if not violations and not incomplete:
             continue
 
         v_count = sum(len(v.get('nodes', [])) for v in violations)
+        i_count = sum(len(v.get('nodes', [])) for v in incomplete)
         html_parts.append('<div class="page-section">')
         html_parts.append('<h3><a href="{}" class="page-url">{}</a></h3>'.format(
             _esc(url), _esc(url)))
-        html_parts.append('<p>{} violation(s), {} issue(s)</p>'.format(
-            len(violations), v_count))
+        html_parts.append('<p>{} violation(s), {} issue(s) &mdash; {} incomplete, {} node(s)</p>'.format(
+            len(violations), v_count, len(incomplete), i_count))
 
         for v in violations:
             impact = v.get('impact', 'unknown')
@@ -526,12 +567,41 @@ def generate_html_report(all_results, output_path, start_url, level_label='WCAG 
             html_parts.append('</details>')
             html_parts.append('</div>')
 
+        if incomplete:
+            html_parts.append('<h4 style="margin-top:1em;color:#e65100;">Incomplete (needs manual review)</h4>')
+            for v in incomplete:
+                impact = v.get('impact', 'unknown')
+                html_parts.append('<div class="rule-card">')
+                html_parts.append(
+                    '<strong><a href="{}">{}</a></strong>'.format(
+                        _esc(v.get('helpUrl', '')), _esc(v.get('id', ''))))
+                html_parts.append('<p>{}</p>'.format(_esc(v.get('help', ''))))
+                nodes = v.get('nodes', [])
+                html_parts.append('<details><summary>{} element(s)</summary>'.format(len(nodes)))
+                for node in nodes[:10]:
+                    html_parts.append('<div class="node-detail">')
+                    target = node.get('target', [])
+                    if target:
+                        html_parts.append('<p class="target">Selector: {}</p>'.format(
+                            _esc(', '.join(str(t) for t in target))))
+                    html_snippet = node.get('html', '')
+                    if html_snippet:
+                        if len(html_snippet) > 300:
+                            html_snippet = html_snippet[:300] + '...'
+                        html_parts.append(
+                            '<div class="html-snippet">{}</div>'.format(_esc(html_snippet)))
+                    html_parts.append('</div>')
+                if len(nodes) > 10:
+                    html_parts.append('<p><em>... and {} more</em></p>'.format(len(nodes) - 10))
+                html_parts.append('</details>')
+                html_parts.append('</div>')
+
         html_parts.append('</div>')
 
     clean_pages = [url for url, data in all_results.items()
-                   if not data.get('violations')]
+                   if not data.get('violations') and not data.get('incomplete')]
     if clean_pages:
-        html_parts.append('<h2>Pages with No Violations ({})'.format(len(clean_pages)))
+        html_parts.append('<h2>Fully Clean Pages ({})'.format(len(clean_pages)))
         html_parts.append('</h2><ul>')
         for url in clean_pages:
             html_parts.append('<li><a href="{}">{}</a></li>'.format(_esc(url), _esc(url)))
@@ -646,12 +716,17 @@ def main():
     print("HTML report: {}".format(html_path))
 
     # Summary
-    total_issues = sum(
+    total_violations = sum(
         sum(len(v.get('nodes', [])) for v in data.get('violations', []))
         for data in results.values()
     )
-    print("\nScan complete: {} pages scanned, {} total issues found.".format(
-        len(results), total_issues))
+    total_incomplete = sum(
+        sum(len(v.get('nodes', [])) for v in data.get('incomplete', []))
+        for data in results.values()
+    )
+    print("\nScan complete: {} pages scanned".format(len(results)))
+    print("  Violations: {} node(s) failing WCAG rules".format(total_violations))
+    print("  Incomplete: {} node(s) needing manual review".format(total_incomplete))
 
 
 if __name__ == '__main__':

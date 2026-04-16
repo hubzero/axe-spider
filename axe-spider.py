@@ -34,10 +34,12 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
@@ -359,6 +361,30 @@ def load_axe_source():
         sys.exit(2)
     with open(AXE_JS_PATH, 'r') as f:
         return f.read()
+
+
+class RateLimiter:
+    """Thread-safe rate limiter that enforces a minimum delay between calls.
+
+    Used to ensure that all worker threads together don't exceed the
+    robots.txt Crawl-delay.  Each worker calls wait() before making a
+    request, and it sleeps if needed to maintain the minimum interval.
+    """
+
+    def __init__(self, min_interval):
+        self.min_interval = min_interval
+        self._lock = threading.Lock()
+        self._last_time = 0
+
+    def wait(self):
+        if self.min_interval <= 0:
+            return
+        with self._lock:
+            now = time.time()
+            elapsed = now - self._last_time
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            self._last_time = time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -780,16 +806,6 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
             pass  # not on Linux or no permission — harmless
 
     page_wait = _safe_int(config.get('page_wait', 1), 1)
-
-    # Respect robots.txt Crawl-delay if it's longer than our configured wait.
-    # This prevents us from hitting the server faster than the site owner allows.
-    if robots_parser is not None:
-        crawl_delay = robots_parser.crawl_delay('axe-spider')
-        if crawl_delay is not None and crawl_delay > page_wait:
-            if not quiet:
-                print("Robots.txt crawl-delay: {}s (overrides page_wait: {}s)".format(
-                    crawl_delay, page_wait))
-            page_wait = int(crawl_delay)
     axe_source = load_axe_source()
     driver = create_browser(config)
     base_url = start_url
@@ -868,7 +884,99 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
         except Exception as e:
             print('  (flush failed: {})'.format(str(e)[:80]))
 
-    # SIGTERM/SIGINT handler: flush partial results, quit driver, exit
+    # How many browser instances to run in parallel.  Each gets its own
+    # Chromium process (~200-500MB), so don't set this too high on
+    # memory-constrained servers.
+    num_workers = _safe_int(config.get('workers', 1), 1)
+
+    # Rate limiter shared across all workers to enforce robots.txt crawl delay.
+    # This is separate from page_wait (which is per-worker JS settle time).
+    # Only the robots.txt crawl_delay is a cross-worker rate limit — page_wait
+    # is applied per-worker after each page load to let JavaScript settle.
+    crawl_delay = 0
+    if robots_parser is not None:
+        delay = robots_parser.crawl_delay('axe-spider')
+        if delay is not None:
+            crawl_delay = int(delay)
+    rate_limiter = RateLimiter(crawl_delay)
+
+    # Thread-safe locks for shared state
+    write_lock = threading.Lock()
+    print_lock = threading.Lock()
+    queue_lock = threading.Lock()
+
+    def _scan_one_page(browser, url):
+        """Scan a single page and return (url, page_data, new_links) or None."""
+        status = http_status(url)
+
+        # Enforce cross-worker rate limit (from robots.txt crawl-delay)
+        rate_limiter.wait()
+
+        try:
+            browser.navigate(url)
+            # Per-worker settle time for JS frameworks (MathJax, SPAs, etc.)
+            time.sleep(page_wait)
+
+            current = browser.current_url
+
+            # Redirected off-origin — skip
+            if not is_same_origin(current, base_url):
+                return None
+
+            # Same-origin redirect — use actual URL
+            actual_url = normalize_url(current)
+            with queue_lock:
+                if actual_url != url:
+                    if actual_url in visited:
+                        return None
+                    visited.add(actual_url)
+                    url = actual_url
+
+            # Skip empty pages
+            page_html = (browser.page_source or '')
+            if len(page_html) < 100:
+                return None
+
+            # Skip non-HTML responses
+            page_start = (browser.run_js(
+                "return document.documentElement.outerHTML.substring(0, 80);") or '')
+            if page_start and '<html' not in page_start.lower():
+                return None
+
+            results = run_axe(browser, axe_source, tags, rules)
+            if 'error' in results:
+                with print_lock:
+                    print("  ERROR on {}: {}".format(url, results['error']))
+                return None
+
+            violations = results.get('violations', [])
+            incomplete = results.get('incomplete', [])
+            passes = results.get('passes', [])
+
+            page_data = {
+                'url': url,
+                'timestamp': datetime.now().isoformat(),
+                'http_status': status if status != 0 else None,
+                'violations': violations,
+                'incomplete': incomplete,
+                'passes': passes,
+                'inapplicable': results.get('inapplicable', []),
+            }
+
+            # Discover new links (unless using a URL list or error page)
+            new_links = []
+            is_ok = (status == 0 or status < 400)
+            if not no_crawl and is_ok:
+                new_links = extract_links(browser, base_url)
+
+            return (url, page_data, new_links)
+
+        except Exception as e:
+            with print_lock:
+                print("  Error on {}: {}, skipping".format(url, str(e)[:100]))
+            return None
+
+    # SIGTERM/SIGINT handler: flush partial results and exit
     interrupted = False
 
     def _on_signal(signum, frame):
@@ -878,153 +986,140 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
         interrupted = True
         print('\n!! Signal {} — flushing {} pages...'.format(signum, page_count))
         _flush(reason='signal {}'.format(signum))
-        try:
-            driver.quit()
-        except Exception:
-            pass
         sys.exit(128 + signum)
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
+    # Create browser pool — one per worker
+    browsers = [driver]
+    for _ in range(num_workers - 1):
+        browsers.append(create_browser(config))
+
+    if not quiet and num_workers > 1:
+        print("  Workers: {} (parallel)".format(num_workers))
+
     try:
-        while queue and page_count < max_pages and not interrupted:
-            url = queue.popleft()
-            if url in visited:
-                continue
-            visited.add(url)
+        if num_workers <= 1:
+            # --- Serial mode (original behavior, no thread overhead) ---
+            while queue and page_count < max_pages and not interrupted:
+                url = queue.popleft()
+                if url in visited:
+                    continue
+                visited.add(url)
 
-            if not should_scan(url, base_url, include_paths, exclude_paths,
-                               exclude_regex, exclude_query, robots_parser):
-                continue
-
-            page_count += 1
-
-            # Pre-check the HTTP status with a lightweight HEAD request before
-            # launching the full Chromium page load.  We still scan error pages
-            # (they may have a11y issues worth knowing about), but we DON'T
-            # follow their links.  Error pages typically render the site's full
-            # nav chrome, and following those links would cause the crawler to
-            # fan out from dead URLs and waste time on unrelated pages.
-            status = http_status(url)
-            if not quiet and verbose and status and status >= 400:
-                print("[{}/{}] HTTP {} on {}".format(
-                    page_count, max_pages, status, url))
-
-            try:
-                driver.navigate(url)
-                time.sleep(page_wait)
-
-                # After the page loads, check where the browser actually ended up.
-                # The server may have redirected us (e.g. HTTP 302).
-                current = driver.current_url
-
-                # Case 1: Redirected to a different domain entirely.
-                # Don't scan it and don't count it toward our page limit.
-                if not is_same_origin(current, base_url):
-                    if verbose:
-                        print("  REDIRECTED to {}, skipping".format(current[:80]))
-                    page_count -= 1
+                if not should_scan(url, base_url, include_paths, exclude_paths,
+                                   exclude_regex, exclude_query, robots_parser):
                     continue
 
-                # Case 2: Same-origin redirect (e.g. /members → /login).
-                # This often happens with login walls.  We scan the actual
-                # destination but need to avoid scanning it twice if we
-                # encounter the redirect target URL later in the queue.
-                actual_url = normalize_url(current)
-                if actual_url != url:
-                    if verbose:
-                        print("  REDIRECTED: {} -> {}".format(url, actual_url))
-                    if actual_url in visited:
-                        if verbose:
-                            print("  SKIP: already scanned redirect target")
-                        continue
-                    visited.add(actual_url)
-                    url = actual_url  # report results under the actual URL
+                page_count += 1
+                result = _scan_one_page(driver, url)
 
-                # Skip empty/broken pages (e.g. auth walls that render blank)
-                page_html = (driver.page_source or '')
-                if len(page_html) < 100:
+                if result is not None:
+                    url, page_data, new_links = result
+                    v_count = _count_nodes(page_data.get('violations', []))
+                    i_count = _count_nodes(page_data.get('incomplete', []))
+
                     if not quiet:
-                        print("  Empty page ({} bytes), skipping".format(len(page_html)))
-                    page_count -= 1
-                    continue
+                        page_width = len(str(max_pages))
+                        status_parts = []
+                        if v_count:
+                            status_parts.append('{} violations'.format(v_count))
+                        if i_count:
+                            status_parts.append('{} incomplete'.format(i_count))
+                        status_str = ', '.join(status_parts) if status_parts else 'clean'
+                        print("[{}/{}] {} — {}".format(
+                            str(page_count).rjust(page_width), max_pages,
+                            url, status_str))
+                        if verbose and (v_count or i_count):
+                            print("  Violations: {} ({} nodes), Incomplete: {} ({} nodes)".format(
+                                len(page_data['violations']), v_count,
+                                len(page_data['incomplete']), i_count))
 
-                # Skip non-HTML responses.  When Chrome loads a JSON or XML endpoint,
-                # it wraps the content in a minimal HTML shell that doesn't contain
-                # a real <html> tag from the server.  We check the first 80 chars
-                # of the rendered DOM to detect this.
-                page_start = (driver.run_js(
-                    "return document.documentElement.outerHTML.substring(0, 80);") or '')
-                if page_start and '<html' not in page_start.lower():
-                    if not quiet:
-                        print("  SKIP: non-HTML response")
-                    page_count -= 1
-                    continue
+                    _write_page(url, page_data)
 
-                results = run_axe(driver, axe_source, tags, rules)
-
-                if 'error' in results:
-                    print("  ERROR: {}".format(results['error']))
-                    continue
-
-                violations = results.get('violations', [])
-                incomplete = results.get('incomplete', [])
-                passes = results.get('passes', [])
-
-                v_count = _count_nodes(violations)
-                i_count = _count_nodes(incomplete)
-
-                # Default: compact one-line progress.  -v: detailed breakdown.
-                if not quiet:
-                    page_width = len(str(max_pages))
-                    status_parts = []
-                    if v_count:
-                        status_parts.append('{} violations'.format(v_count))
-                    if i_count:
-                        status_parts.append('{} incomplete'.format(i_count))
-                    status_str = ', '.join(status_parts) if status_parts else 'clean'
-                    print("[{}/{}] {} — {}".format(
-                        str(page_count).rjust(page_width), max_pages,
-                        url, status_str))
-                    if verbose and (v_count or i_count):
-                        print("  Violations: {} ({} nodes), Incomplete: {} ({} nodes), Passes: {}".format(
-                            len(violations), v_count, len(incomplete), i_count, len(passes)))
-
-                page_data = {
-                    'url': url,
-                    'timestamp': datetime.now().isoformat(),
-                    'http_status': status if status != 0 else None,
-                    'violations': violations,
-                    'incomplete': incomplete,
-                    'passes': passes,
-                    'inapplicable': results.get('inapplicable', []),
-                }
-                _write_page(url, page_data)
-
-                # Discover new links (unless using a URL list or page returned an error)
-                is_ok = (status == 0 or status < 400)
-                if not no_crawl and is_ok:
-                    new_links = extract_links(driver, base_url)
                     for link in new_links:
                         if link not in visited and link not in queue:
                             queue.append(link)
+                else:
+                    page_count -= 1
 
-            except TimeoutException:
-                print("  TIMEOUT loading page, skipping")
-            except WebDriverException as e:
-                print("  WebDriver error: {}, skipping".format(str(e)[:100]))
-            except Exception as e:
-                print("  Error: {}, skipping".format(str(e)[:100]))
+                if json_path and save_every and page_count % save_every == 0:
+                    _flush()
 
-            # Incremental flush
-            if json_path and save_every and page_count % save_every == 0:
-                _flush()
+        else:
+            # --- Parallel mode: thread pool with shared queue ---
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                while (queue or pool._work_queue.qsize() > 0) and \
+                        page_count < max_pages and not interrupted:
+                    # Submit a batch of URLs to workers
+                    futures = {}
+                    while queue and len(futures) < num_workers and \
+                            page_count + len(futures) < max_pages:
+                        url = queue.popleft()
+                        if url in visited:
+                            continue
+                        visited.add(url)
+                        if not should_scan(url, base_url, include_paths,
+                                           exclude_paths, exclude_regex,
+                                           exclude_query, robots_parser):
+                            continue
+                        # Round-robin browser assignment
+                        browser_idx = len(futures) % num_workers
+                        future = pool.submit(
+                            _scan_one_page, browsers[browser_idx], url)
+                        futures[future] = url
+
+                    if not futures:
+                        break
+
+                    # Collect results as they complete
+                    for future in as_completed(futures):
+                        page_count += 1
+                        result = future.result()
+
+                        if result is not None:
+                            url, page_data, new_links = result
+                            v_count = _count_nodes(
+                                page_data.get('violations', []))
+                            i_count = _count_nodes(
+                                page_data.get('incomplete', []))
+
+                            with print_lock:
+                                if not quiet:
+                                    pw = len(str(max_pages))
+                                    parts = []
+                                    if v_count:
+                                        parts.append(
+                                            '{} violations'.format(v_count))
+                                    if i_count:
+                                        parts.append(
+                                            '{} incomplete'.format(i_count))
+                                    ss = ', '.join(parts) if parts else 'clean'
+                                    print("[{}/{}] {} — {}".format(
+                                        str(page_count).rjust(pw),
+                                        max_pages, url, ss))
+
+                            with write_lock:
+                                _write_page(url, page_data)
+
+                            with queue_lock:
+                                for link in new_links:
+                                    if link not in visited and \
+                                            link not in queue:
+                                        queue.append(link)
+                        else:
+                            page_count -= 1
+
+                    if json_path and save_every and \
+                            page_count % save_every == 0:
+                        _flush()
 
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        for browser in browsers:
+            try:
+                browser.quit()
+            except Exception:
+                pass
         _flush(reason='final')
 
     return page_count, jsonl_path
@@ -1638,6 +1733,9 @@ def main():
                         help='Output directory (default: from config or current directory)')
     parser.add_argument('--allowlist', default=None,
                         help='YAML file of known-acceptable incompletes to suppress')
+    parser.add_argument('--workers', type=int, default=None,
+                        help='Number of parallel browser instances (default: 1). '
+                             'Each uses ~200-500MB RAM. Rate limits are shared.')
     parser.add_argument('--save-every', type=int, default=None,
                         help='Flush reports every N pages (default: 25). '
                              'Partial results survive if the scan is killed.')
@@ -1828,6 +1926,10 @@ OTHER NOTES
 
     # Resolve output
     save_every = args.save_every or _safe_int(config.get('save_every', 25), 25)
+
+    # Workers: number of parallel browser instances
+    if args.workers:
+        config['workers'] = args.workers
     basename = args.output or 'axe-spider-{}'.format(datetime.now().strftime('%Y-%m-%d-%H%M%S'))
     output_dir = args.output_dir or config.get('output_dir', os.getcwd())
     os.makedirs(output_dir, exist_ok=True)

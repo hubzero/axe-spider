@@ -48,6 +48,7 @@ All settings in `axe-spider.yaml` can be overridden on the command line.
 | `exclude_regex` | — | — | Regex patterns to skip (e.g. auth-protected routes) |
 | `exclude_query` | — | — | Query substrings to skip (e.g. `action=overview`) |
 | `include_paths` | `--include-path` | — | Only scan URLs under these prefixes |
+| `strip_query_params` | — | — | Query parameters to strip for URL deduplication |
 | `niceness` | — | 10 | OS nice level (0–19, higher = lower CPU priority) |
 | `oom_score_adj` | — | 1000 | Linux OOM killer score (1000 = killed first) |
 | `allowlist` | `--allowlist` | — | YAML file of known-acceptable incompletes |
@@ -55,6 +56,7 @@ All settings in `axe-spider.yaml` can be overridden on the command line.
 | `ignore_certificate_errors` | — | false | Accept self-signed TLS certs |
 | `driver` | `--driver` | `selenium` | Browser driver: `selenium` or `playwright` |
 | `workers` | `--workers` | 1 | Parallel browser instances |
+| `restart_every` | — | 500 | Restart browser every N pages (prevents memory leaks) |
 | `chromium_path` | — | `/usr/bin/chromium-browser` | Path to Chrome/Chromium |
 | `chromedriver_path` | — | `/usr/bin/chromedriver` | Path to ChromeDriver (selenium only) |
 

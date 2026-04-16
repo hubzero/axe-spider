@@ -21,6 +21,11 @@ page_wait: 1
 # Flush reports every N pages (partial results survive kills)
 save_every: 25
 
+# Restart browser every N pages to prevent Chromium memory leaks.
+# Long scans accumulate DOM nodes, JS heaps, and image caches,
+# causing slowdowns and occasional 60s+ hangs.
+restart_every: 500
+
 # Paths to exclude from scanning (prefix match)
 exclude_paths:
   - /login

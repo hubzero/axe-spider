@@ -1104,6 +1104,11 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
         for _ in range(num_workers - 1):
             browsers.append(create_browser(config))
 
+    # Periodically restart the browser to prevent memory leaks.
+    # Chromium accumulates garbage (DOM nodes, JS heaps, image caches) over
+    # hundreds of pages, causing slowdowns and occasional 60s+ hangs.
+    restart_every = _safe_int(config.get('restart_every', 500), 500)
+
     if not quiet and num_workers > 1:
         print("  Workers: {} (parallel)".format(num_workers))
 
@@ -1159,6 +1164,17 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
 
                 if json_path and save_every and page_count % save_every == 0:
                     _flush()
+
+                # Restart browser periodically to prevent memory leaks
+                if restart_every and page_count % restart_every == 0:
+                    if not quiet:
+                        print("  [restarting browser after {} pages]".format(
+                            page_count))
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                    driver = create_browser(config)
 
         elif is_playwright and num_workers > 1:
             # --- Playwright parallel: async sliding window ---
@@ -1429,6 +1445,57 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                 and page_count % save_every == 0):
                             _flush()
 
+                        # Restart browser periodically to prevent memory leaks.
+                        # Wait for all in-flight pages to finish first.
+                        if (restart_every
+                                and page_count % restart_every == 0
+                                and page_count < max_pages):
+                            # Drain remaining in-flight tasks
+                            while pending:
+                                done2, _ = await asyncio.wait(
+                                    pending.keys(),
+                                    return_when=asyncio.FIRST_COMPLETED)
+                                for t2 in done2:
+                                    del pending[t2]
+                                    task_workers.pop(t2, None)
+                                    page_count += 1
+                                    try:
+                                        r2 = t2.result()
+                                    except Exception:
+                                        r2 = None
+                                    if r2 is not None:
+                                        u2, pd2, nl2, _, el2 = r2
+                                        total_page_time += el2
+                                        _write_page(u2, pd2)
+                                        for lnk in nl2:
+                                            if (lnk not in visited
+                                                    and lnk not in queue):
+                                                queue.append(lnk)
+                                    else:
+                                        page_count -= 1
+                            # Restart
+                            if not quiet:
+                                print("  [restarting browser after"
+                                      " {} pages]".format(page_count))
+                            try:
+                                await browser.close()
+                            except Exception:
+                                pass
+                            launch_kw = {
+                                'headless': True, 'args': launch_args}
+                            if (chromium_path
+                                    and os.path.isfile(chromium_path)):
+                                launch_kw['executable_path'] = (
+                                    chromium_path)
+                            browser = await pw.chromium.launch(
+                                **launch_kw)
+                            try:
+                                _register_browser_pid(
+                                    browser.process.pid)
+                            except Exception:
+                                pass
+                            active_wids.clear()
+
                     try:
                         await browser.close()
                     except Exception:
@@ -1452,7 +1519,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                         visited.add(url)
                         if not should_scan(url, base_url, include_paths,
                                            exclude_paths, exclude_regex,
-                                           exclude_query, robots_parser):
+                                           robots_parser=robots_parser):
                             continue
                         browser_idx = len(futures) % num_workers
                         # Stagger starts so results stream evenly
@@ -1515,6 +1582,23 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                     if json_path and save_every and \
                             page_count % save_every == 0:
                         _flush()
+
+                    # Restart all browsers periodically to prevent
+                    # memory leaks.  Safe here because all futures from
+                    # the current batch have completed.
+                    if (restart_every
+                            and page_count % restart_every == 0
+                            and page_count < max_pages):
+                        if not quiet:
+                            print("  [restarting {} browsers after"
+                                  " {} pages]".format(
+                                      len(browsers), page_count))
+                        for i, b in enumerate(browsers):
+                            try:
+                                b.quit()
+                            except Exception:
+                                pass
+                            browsers[i] = create_browser(config)
 
     finally:
         for browser in browsers:

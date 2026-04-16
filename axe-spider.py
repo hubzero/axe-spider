@@ -1043,6 +1043,9 @@ def generate_html_report(jsonl_path, output_path, start_url,
     html_parts.append('<h1>Axe Accessibility Scan Report</h1>')
     html_parts.append('<p class="meta">Scanned: {} | {} | Generated: {} | axe-core {}</p>'.format(
         _esc(start_url), _esc(level_label), now, axe_ver))
+    html_parts.append('<p class="meta">Scope: HTML pages only. '
+                      'Does not cover PDFs, videos, audio, PowerPoint, Word documents, '
+                      'or other media files.</p>')
 
     html_parts.append('<div class="summary-grid">')
     html_parts.append(
@@ -1248,7 +1251,8 @@ def _render_nodes_html(nodes, limit=20, snippet_max=500):
 
 
 def generate_llm_report(jsonl_path, output_path, start_url,
-                        level_label='WCAG 2.1 Level AA', allowlist=None):
+                        level_label='WCAG 2.1 Level AA', allowlist=None,
+                        config=None):
     """Generate a token-efficient markdown summary optimized for LLMs.
 
     Instead of dumping raw JSON (100K+ tokens for a large scan), this
@@ -1325,14 +1329,24 @@ def generate_llm_report(jsonl_path, output_path, start_url,
     lines.append('axe-core: {}  '.format(axe_ver))
     lines.append('Pages scanned: {}  '.format(total_pages))
     lines.append('Scan date: {}\n'.format(datetime.now().strftime('%Y-%m-%d')))
+    lines.append('**Scope**: HTML pages only.  This scan does not cover accessibility of '
+                 'PDFs, videos, audio, PowerPoint, Word documents, or other media files.')
 
-    lines.append('## Instructions\n')
-    lines.append('This is a WCAG accessibility scan summary. When investigating:')
-    lines.append('- Each violation needs a code fix — find the template/CSS that generates the flagged HTML')
-    lines.append('- Incompletes are items axe-core could not auto-verify (usually contrast on gradients/images)')
-    lines.append('- The "examples" show representative HTML — the same pattern repeats across listed pages')
-    lines.append('- Check the helpUrl for each rule to understand what WCAG requires')
-    lines.append('- Focus on violations first (failures), then incompletes (may be false positives)\n')
+    # Instructions section — read from a file if configured, otherwise use defaults.
+    # This lets each site customize the LLM prompt for their specific codebase
+    # (e.g. "templates are in app/templates/cdm/", "use LESS not CSS", etc.)
+    llm_instructions_path = config.get('llm_instructions') if config else None
+    if llm_instructions_path and os.path.exists(llm_instructions_path):
+        with open(llm_instructions_path) as f:
+            lines.append(f.read().rstrip())
+        lines.append('')
+    else:
+        lines.append('## Instructions\n')
+        lines.append('This is a WCAG accessibility scan summary. When investigating:')
+        lines.append('- Each violation needs a code fix — find the source that generates the flagged HTML')
+        lines.append('- Incompletes are items axe-core could not auto-verify (usually contrast issues)')
+        lines.append('- The "examples" show representative HTML — the same pattern repeats across listed pages')
+        lines.append('- Focus on violations first (failures), then incompletes (may be false positives)\n')
 
     # Violations
     if violations_by_rule:
@@ -1380,6 +1394,18 @@ def generate_llm_report(jsonl_path, output_path, start_url,
 
     if suppressed_count:
         lines.append('## Suppressed (allowlist): {} nodes\n'.format(suppressed_count))
+
+    # Point to full reports for deeper investigation
+    json_sibling = output_path.replace('.md', '.json')
+    jsonl_sibling = output_path.replace('.md', '.jsonl')
+    html_sibling = output_path.replace('.md', '.html')
+    lines.append('## Detailed reports\n')
+    lines.append('This is a summary.  For full per-page, per-node details:')
+    lines.append('- JSON (full axe-core output): {}'.format(json_sibling))
+    lines.append('- JSONL (streaming, for --diff/--rescan): {}'.format(jsonl_sibling))
+    lines.append('- HTML (human-readable report): {}'.format(html_sibling))
+    lines.append('- Run `axe-spider.py --help-audit` for the full audit workflow guide')
+    lines.append('')
 
     report = '\n'.join(lines)
     with open(output_path, 'w') as f:
@@ -1707,7 +1733,8 @@ OTHER NOTES
     if args.llm and jsonl_path and os.path.exists(jsonl_path):
         llm_path = os.path.join(output_dir, basename + '.md')
         generate_llm_report(jsonl_path, llm_path, url,
-                            level_label=level_label, allowlist=allowlist)
+                            level_label=level_label, allowlist=allowlist,
+                            config=config)
         print("LLM report: {}".format(llm_path))
 
     # Summary (single pass through JSONL)

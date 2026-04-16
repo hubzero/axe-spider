@@ -49,6 +49,12 @@ oom_score_adj: 1000
 # Allowlist of known-acceptable incompletes (see allowlist.yaml.example)
 # allowlist: allowlist.yaml
 
+# Custom instructions for the --llm report (path to a markdown file).
+# Use this to give site-specific context like where templates live,
+# what CSS preprocessor to use, coding conventions, etc.
+# If not set, generic WCAG instructions are used.
+# llm_instructions: llm-instructions.md
+
 # Ignore robots.txt restrictions (default: obey robots.txt)
 # ignore_robots: true
 

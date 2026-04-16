@@ -1,0 +1,20 @@
+# axe-spider site configuration — cdmHUB
+#
+# Site-specific settings. Command-line arguments override these.
+
+url: https://cdmhub.org/
+level: wcag21aa
+max_pages: 50
+output_dir: /var/www/cdmhub/reports
+
+# Seconds to wait after page load for JS to settle (MathJax, AssistiveMML)
+page_wait: 3
+
+# Paths to exclude from scanning
+exclude_paths:
+  - /login
+  - /api
+
+# Chromium / ChromeDriver paths
+chromium_path: /usr/bin/chromium-browser
+chromedriver_path: /usr/bin/chromedriver

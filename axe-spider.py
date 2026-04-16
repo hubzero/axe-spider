@@ -1022,6 +1022,8 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
         queue = deque([normalize_url(start_url)])
         no_crawl = False
     page_count = 0
+    scan_start_time = time.time()
+    total_page_time = 0  # accumulated per-page scan times
 
     # MEMORY STRATEGY: Stream results to a JSONL file (one JSON object per line)
     # instead of accumulating everything in a Python dict.  Without this, a
@@ -1105,7 +1107,8 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
     queue_lock = threading.Lock()
 
     def _scan_one_page(browser, url):
-        """Scan a single page and return (url, page_data, new_links) or None."""
+        """Scan a single page and return (url, page_data, new_links, elapsed) or None."""
+        page_start = time.time()
         status = http_status(url)
 
         # Enforce cross-worker rate limit (from robots.txt crawl-delay)
@@ -1168,7 +1171,8 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
             if not no_crawl and is_ok:
                 new_links = extract_links(browser, base_url)
 
-            return (url, page_data, new_links)
+            elapsed = time.time() - page_start
+            return (url, page_data, new_links, elapsed)
 
         except Exception as e:
             with print_lock:
@@ -1218,7 +1222,8 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                 result = _scan_one_page(driver, url)
 
                 if result is not None:
-                    url, page_data, new_links = result
+                    url, page_data, new_links, elapsed = result
+                    total_page_time += elapsed
                     v_count = _count_nodes(page_data.get('violations', []))
                     i_count = _count_nodes(page_data.get('incomplete', []))
 
@@ -1230,9 +1235,9 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                         if i_count:
                             status_parts.append('{} incomplete'.format(i_count))
                         status_str = ', '.join(status_parts) if status_parts else 'clean'
-                        print("[{}/{}] {} — {}".format(
+                        print("[{}/{}] {} — {} ({:.1f}s)".format(
                             str(page_count).rjust(page_width), max_pages,
-                            url, status_str))
+                            url, status_str, elapsed))
                         if verbose and (v_count or i_count):
                             print("  Violations: {} ({} nodes), Incomplete: {} ({} nodes)".format(
                                 len(page_data['violations']), v_count,
@@ -1263,7 +1268,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                 run_opts['runOnly'] = {'type': 'tag', 'values': tags}
 
             async def _pw_sliding_window():
-                nonlocal page_count
+                nonlocal page_count, total_page_time
                 from playwright.async_api import async_playwright
                 async with async_playwright() as pw:
                     launch_args = [
@@ -1289,8 +1294,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                     async def _scan(url, worker_id=0,
                                     skip_rate_limit=False):
                         """Scan one URL — mirrors _scan_one_page."""
-                        # Run blocking HTTP check in a thread so it
-                        # doesn't freeze the async event loop
+                        page_t0 = time.time()
                         loop = asyncio.get_event_loop()
                         status = await loop.run_in_executor(
                             None, http_status, url)
@@ -1354,6 +1358,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                     normalize_url(lnk)
                                     for lnk in (links or []) if lnk]
 
+                            elapsed = time.time() - page_t0
                             return (actual, {
                                 'url': actual,
                                 'timestamp':
@@ -1368,7 +1373,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                     results.get('passes', []),
                                 'inapplicable':
                                     results.get('inapplicable', []),
-                            }, new_links, worker_id)
+                            }, new_links, worker_id, elapsed)
                         except Exception:
                             return None
                         finally:
@@ -1418,13 +1423,14 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                             _make_staggered(url, i * stagger, wid)())
                         pending[task] = url
 
-                    # Track which worker IDs are in use so we can
-                    # show which worker produced each result.
+                    # Track which worker IDs are in use.
                     # task_workers maps task -> worker_id
                     task_workers = {}
-                    for task, url in pending.items():
-                        task_workers[task] = 1  # initial task is W1
-                    active_wids = {1}
+                    active_wids = set()
+                    for i, task in enumerate(pending.keys()):
+                        wid = i + 1
+                        task_workers[task] = wid
+                        active_wids.add(wid)
 
                     def _free_wid():
                         """Return the lowest available worker ID."""
@@ -1456,7 +1462,8 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                 pass
 
                             if result is not None:
-                                url, page_data, new_links, _ = result
+                                url, page_data, new_links, _, elapsed = result
+                                total_page_time += elapsed
                                 v_count = _count_nodes(
                                     page_data.get('violations', []))
                                 i_count = _count_nodes(
@@ -1474,9 +1481,10 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                                 i_count))
                                     ss = (', '.join(parts)
                                           if parts else 'clean')
-                                    print("[{}/{}] W{} {} — {}".format(
+                                    print("[{}/{}] W{} {} — {} ({:.1f}s)".format(
                                         str(page_count).rjust(pw_w),
-                                        max_pages, wid, url, ss))
+                                        max_pages, wid, url, ss,
+                                        elapsed))
                                 _write_page(url, page_data)
 
                                 for link in new_links:
@@ -1546,7 +1554,8 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                         result = future.result()
 
                         if result is not None:
-                            url, page_data, new_links = result
+                            url, page_data, new_links, elapsed = result
+                            total_page_time += elapsed
                             v_count = _count_nodes(
                                 page_data.get('violations', []))
                             i_count = _count_nodes(
@@ -1563,9 +1572,9 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                         parts.append(
                                             '{} incomplete'.format(i_count))
                                     ss = ', '.join(parts) if parts else 'clean'
-                                    print("[{}/{}] {} — {}".format(
+                                    print("[{}/{}] {} — {} ({:.1f}s)".format(
                                         str(page_count).rjust(pw),
-                                        max_pages, url, ss))
+                                        max_pages, url, ss, elapsed))
 
                             with write_lock:
                                 _write_page(url, page_data)
@@ -1590,7 +1599,8 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                 pass
         _flush(reason='final')
 
-    return page_count, jsonl_path
+    wall_time = time.time() - scan_start_time
+    return page_count, jsonl_path, wall_time, total_page_time
 
 
 def _iter_jsonl(jsonl_path):
@@ -2454,7 +2464,7 @@ OTHER NOTES
     html_path = os.path.join(output_dir, basename + '.html')
     json_path = os.path.join(output_dir, basename + '.json')
 
-    scanned, jsonl_path = crawl_and_scan(
+    scanned, jsonl_path, wall_time, total_page_time = crawl_and_scan(
         url,
         max_pages=max_pages,
         tags=tags,
@@ -2498,7 +2508,9 @@ OTHER NOTES
             for v in data.get('violations', []):
                 violation_rules.add(v.get('id', ''))
 
-    print("\nScan complete: {} pages scanned".format(scanned))
+    avg_time = (total_page_time / scanned) if scanned else 0
+    print("\nScan complete: {} pages in {:.1f}s ({:.1f}s avg/page)".format(
+        scanned, wall_time, avg_time))
     print("  Violations: {} node(s) failing WCAG rules".format(total_violations))
     print("  Incomplete: {} node(s) needing manual review".format(total_incomplete))
 

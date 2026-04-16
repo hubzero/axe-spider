@@ -268,6 +268,11 @@ def get_axe_version():
 
 
 def load_axe_source():
+    if not os.path.exists(AXE_JS_PATH):
+        print("ERROR: axe-core not found at {}".format(AXE_JS_PATH), file=sys.stderr)
+        print("Download it: curl -o axe.min.js https://cdn.jsdelivr.net/npm/axe-core/axe.min.js",
+              file=sys.stderr)
+        sys.exit(2)
     with open(AXE_JS_PATH, 'r') as f:
         return f.read()
 
@@ -295,10 +300,21 @@ def create_driver(config=None):
 
     chromedriver = config.get('chromedriver_path', '/usr/bin/chromedriver')
     try:
-        from selenium.webdriver.chrome.service import Service
-        driver = webdriver.Chrome(service=Service(chromedriver), options=opts)
-    except (ImportError, TypeError):
-        driver = webdriver.Chrome(executable_path=chromedriver, options=opts)
+        try:
+            from selenium.webdriver.chrome.service import Service
+            driver = webdriver.Chrome(service=Service(chromedriver), options=opts)
+        except (ImportError, TypeError):
+            driver = webdriver.Chrome(executable_path=chromedriver, options=opts)
+    except WebDriverException as e:
+        msg = str(e)[:200]
+        print("ERROR: Could not start browser.", file=sys.stderr)
+        if 'chromedriver' in msg.lower() or 'cannot find' in msg.lower():
+            print("  ChromeDriver not found at: {}".format(chromedriver), file=sys.stderr)
+        if 'chrome' in msg.lower() and 'not found' in msg.lower():
+            print("  Chromium not found at: {}".format(
+                config.get('chromium_path', '/usr/bin/chromium-browser')), file=sys.stderr)
+        print("  Detail: {}".format(msg), file=sys.stderr)
+        sys.exit(2)
     driver.set_page_load_timeout(30)
     driver.set_script_timeout(120)
     driver.implicitly_wait(5)
@@ -396,11 +412,13 @@ def extract_links(driver, base_url):
 
 def run_axe(driver, axe_source, tags=None, rules=None):
     """Inject axe-core and run analysis on the current page."""
-    driver.execute_script(axe_source)
+    try:
+        driver.execute_script(axe_source)
+    except (WebDriverException, Exception) as e:
+        return {'error': 'axe-core injection failed: {}'.format(str(e)[:100])}
 
     run_opts = {}
     if rules:
-        # Run only specific rules by ID
         run_opts['runOnly'] = {'type': 'rule', 'values': rules}
     elif tags:
         run_opts['runOnly'] = {'type': 'tag', 'values': tags}
@@ -414,7 +432,12 @@ def run_axe(driver, axe_source, tags=None, rules=None):
         callback({error: err.toString()});
     });
     """
-    results = driver.execute_async_script(script, run_opts)
+    try:
+        results = driver.execute_async_script(script, run_opts)
+    except (TimeoutException, WebDriverException, Exception) as e:
+        return {'error': 'axe.run() failed: {}'.format(str(e)[:100])}
+    if results is None:
+        return {'error': 'axe.run() returned null (page may have navigated away)'}
     return results
 
 
@@ -501,8 +524,12 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
         """Append one page's results to the JSONL file."""
         if not jsonl_path:
             return
-        with open(jsonl_path, 'a') as f:
-            f.write(json.dumps({url: page_data}, default=str) + '\n')
+        try:
+            with open(jsonl_path, 'a') as f:
+                f.write(json.dumps({url: page_data}, default=str) + '\n')
+        except (IOError, OSError) as e:
+            print("  WARNING: failed to write results for {}: {}".format(
+                url, e), file=sys.stderr)
 
     def _flush(reason=''):
         """Build final JSON + HTML from the JSONL stream on disk."""
@@ -672,13 +699,21 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
 
 
 def _iter_jsonl(jsonl_path):
-    """Iterate (url, data) pairs from a JSONL results file."""
+    """Iterate (url, data) pairs from a JSONL results file.
+
+    Skips blank or corrupt lines (e.g. from a partial write after a crash).
+    """
     with open(jsonl_path, 'r') as f:
-        for line in f:
+        for lineno, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
-            obj = json.loads(line)
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                print("  WARNING: corrupt JSONL line {} in {}, skipping".format(
+                    lineno, jsonl_path), file=sys.stderr)
+                continue
             for url, data in obj.items():
                 yield url, data
 
@@ -1366,6 +1401,8 @@ KEY FLAGS FOR LLM WORKFLOWS
             sys.exit(0)
         print("Rescanning {} pages with previous violations/incompletes".format(len(seed_urls)))
     if args.urls:
+        if not os.path.exists(args.urls):
+            parser.error('URL file not found: {}'.format(args.urls))
         with open(args.urls) as f:
             seed_urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
         if not seed_urls:
@@ -1397,7 +1434,13 @@ KEY FLAGS FOR LLM WORKFLOWS
     exclude_regex = None
     regex_list = config.get('exclude_regex', [])
     if regex_list and not args.no_default_excludes:
-        exclude_regex = [re.compile(p) for p in regex_list]
+        exclude_regex = []
+        for pattern in regex_list:
+            try:
+                exclude_regex.append(re.compile(pattern))
+            except re.error as e:
+                print("WARNING: invalid exclude_regex '{}': {}".format(pattern, e),
+                      file=sys.stderr)
 
     # Resolve exclude query strings from config (e.g. action=overview)
     exclude_query = config.get('exclude_query') if not args.no_default_excludes else None
@@ -1448,17 +1491,14 @@ KEY FLAGS FOR LLM WORKFLOWS
                             level_label=level_label, allowlist=allowlist)
         print("LLM report: {}".format(llm_path))
 
-    # Summary (stream from JSONL, no memory spike)
+    # Summary (single pass through JSONL)
     total_violations = 0
     total_incomplete = 0
+    violation_rules = set()
     if jsonl_path and os.path.exists(jsonl_path):
         for _, data in _iter_jsonl(jsonl_path):
             total_violations += sum(len(v.get('nodes', [])) for v in data.get('violations', []))
             total_incomplete += sum(len(v.get('nodes', [])) for v in data.get('incomplete', []))
-    # Collect unique rule IDs for summary
-    violation_rules = set()
-    if jsonl_path and os.path.exists(jsonl_path):
-        for _, data in _iter_jsonl(jsonl_path):
             for v in data.get('violations', []):
                 violation_rules.add(v.get('id', ''))
 

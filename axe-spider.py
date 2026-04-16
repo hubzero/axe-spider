@@ -1209,6 +1209,8 @@ def main():
                         help='Compare against a previous scan JSONL and show what changed')
     parser.add_argument('--urls', default=None, metavar='FILE',
                         help='Scan URLs from a file (one per line) instead of crawling')
+    parser.add_argument('--rescan', default=None, metavar='PREV.jsonl',
+                        help='Re-scan only pages that had violations or incompletes in a previous scan')
     parser.add_argument('--rule', action='append', default=None,
                         help='Only run specific axe rules (repeatable, e.g. --rule color-contrast)')
     parser.add_argument('--url-only', action='store_true',
@@ -1242,8 +1244,19 @@ def main():
     level_info = WCAG_LEVELS.get(level, {})
     level_label = level_info.get('label', 'Custom') if not args.tags else 'Custom tags'
 
-    # Load URL list from file
+    # Load URL list from file or previous scan
     seed_urls = None
+    if args.rescan:
+        if not os.path.exists(args.rescan):
+            parser.error('Rescan file not found: {}'.format(args.rescan))
+        seed_urls = []
+        for prev_url, prev_data in _iter_jsonl(args.rescan):
+            if prev_data.get('violations') or prev_data.get('incomplete'):
+                seed_urls.append(prev_url)
+        if not seed_urls:
+            print("No failures in previous scan — nothing to rescan.")
+            sys.exit(0)
+        print("Rescanning {} pages with previous violations/incompletes".format(len(seed_urls)))
     if args.urls:
         with open(args.urls) as f:
             seed_urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]

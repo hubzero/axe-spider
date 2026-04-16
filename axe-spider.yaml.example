@@ -44,6 +44,9 @@ oom_score_adj: 1000
 # Allowlist of known-acceptable incompletes (see allowlist.yaml.example)
 # allowlist: allowlist.yaml
 
+# Ignore TLS certificate errors (for self-signed internal sites)
+# ignore_certificate_errors: true
+
 # Chromium / ChromeDriver paths
 chromium_path: /usr/bin/chromium-browser
 chromedriver_path: /usr/bin/chromedriver

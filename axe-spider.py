@@ -268,7 +268,8 @@ def create_driver(config=None):
     opts.add_argument('--disable-dev-shm-usage')
     opts.add_argument('--disable-gpu')
     opts.add_argument('--window-size=1280,1024')
-    opts.add_argument('--ignore-certificate-errors')
+    if config.get('ignore_certificate_errors') in (True, 'true', 'yes', '1'):
+        opts.add_argument('--ignore-certificate-errors')
 
     # Block file downloads — we only need rendered HTML
     prefs = {

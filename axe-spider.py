@@ -1258,8 +1258,10 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                         browser = await pw.chromium.launch(
                             headless=True, args=launch_args)
 
-                    async def _one(url):
+                    async def _one(url, stagger_delay=0):
                         """Scan one URL — mirrors _scan_one_page logic."""
+                        if stagger_delay > 0:
+                            await asyncio.sleep(stagger_delay)
                         # HTTP pre-check (same as serial mode)
                         status = http_status(url)
 
@@ -1333,7 +1335,11 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                         finally:
                             await page.close()
 
-                    tasks = [_one(u) for u in urls_batch]
+                    # Stagger worker starts across the page_wait interval
+                    # so results stream back evenly rather than in bursts.
+                    stagger = pw_time / max(len(urls_batch), 1)
+                    tasks = [_one(u, stagger_delay=i * stagger)
+                             for i, u in enumerate(urls_batch)]
                     raw = await asyncio.gather(
                         *tasks, return_exceptions=True)
                     await browser.close()
@@ -1418,6 +1424,10 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                            exclude_query, robots_parser):
                             continue
                         browser_idx = len(futures) % num_workers
+                        # Stagger starts so results stream evenly
+                        stagger = page_wait / max(num_workers, 1)
+                        if len(futures) > 0:
+                            time.sleep(stagger)
                         future = pool.submit(
                             _scan_one_page, browsers[browser_idx], url)
                         futures[future] = url

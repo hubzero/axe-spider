@@ -422,13 +422,20 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, level=None,
     else:
         level_label = level_label or 'custom'
 
-    # Volunteer to be OOM-killed first — Chromium is memory-hungry and on
-    # shared servers we'd rather lose the scan than Apache or MySQL.
-    try:
-        with open('/proc/self/oom_score_adj', 'w') as f:
-            f.write('1000')
-    except (IOError, PermissionError):
-        pass  # Not on Linux or no permission — harmless
+    # Lower priority so the scan doesn't starve production services.
+    niceness = int(config.get('niceness', 10))
+    oom_score = int(config.get('oom_score_adj', 1000))
+    if niceness:
+        try:
+            os.nice(niceness)
+        except (OSError, PermissionError):
+            pass
+    if oom_score:
+        try:
+            with open('/proc/self/oom_score_adj', 'w') as f:
+                f.write(str(oom_score))
+        except (IOError, PermissionError):
+            pass
 
     page_wait = int(config.get('page_wait', 1))
     axe_source = load_axe_source()

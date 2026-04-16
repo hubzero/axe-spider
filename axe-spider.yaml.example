@@ -35,6 +35,15 @@ exclude_paths:
 # exclude_query:
 #   - action=overview
 
+# Process priority — keep the scan from starving production services.
+# niceness: 0-19 (higher = lower priority, default 10; 0 to disable)
+niceness: 10
+# OOM killer score adjustment — higher = killed first (default 1000; 0 to disable)
+oom_score_adj: 1000
+
+# Allowlist of known-acceptable incompletes (see allowlist.yaml.example)
+# allowlist: allowlist.yaml
+
 # Chromium / ChromeDriver paths
 chromium_path: /usr/bin/chromium-browser
 chromedriver_path: /usr/bin/chromedriver

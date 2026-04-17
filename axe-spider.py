@@ -768,35 +768,40 @@ def should_scan(url, base_url, include_paths, exclude_paths, exclude_regex=None,
 
 
 def http_status(url, timeout=10):
-    """Return HTTP status code via a lightweight HEAD request.
+    """Return (status_code, content_type) via a lightweight HEAD request.
 
     Falls back to GET if the server rejects HEAD (some do).
-    Returns 0 on network error.  Follows redirects — the returned
+    Returns (0, '') on network error.  Follows redirects — the returned
     status reflects the final response, not intermediate 3xx hops.
 
     This is used as a pre-check before loading pages in Chromium.
     It's much cheaper than a full browser load and lets us identify
-    error pages (4xx/5xx) without wasting Chromium resources.
+    error pages (4xx/5xx) and non-HTML responses (application/json)
+    without wasting Chromium resources.
     """
+    def _ct(r):
+        """Extract base content-type (without charset)."""
+        ct = r.headers.get('Content-Type', '')
+        return ct.split(';')[0].strip().lower()
+
     try:
         req = urllib.request.Request(url, method='HEAD',
                                      headers={'User-Agent': 'axe-spider/1.0'})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status
+            return (r.status, _ct(r))
     except urllib.error.HTTPError as e:
-        # 4xx/5xx errors are still valid status codes we want to return
-        return e.code
+        return (e.code, '')
     except Exception:
         # HEAD failed (connection error, or server rejects HEAD) — try GET
         try:
             req = urllib.request.Request(url, method='GET',
                                          headers={'User-Agent': 'axe-spider/1.0'})
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.status
+                return (r.status, _ct(r))
         except urllib.error.HTTPError as e:
-            return e.code
+            return (e.code, '')
         except Exception:
-            return 0  # network error — host unreachable, DNS failure, etc.
+            return (0, '')
 
 
 def extract_links(driver, base_url):
@@ -1018,10 +1023,24 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
             with print_lock:
                 print("  skip: {} — {}".format(url, reason))
 
+    # Content types that indicate an HTML page worth scanning.
+    _HTML_TYPES = {'text/html', 'application/xhtml+xml', ''}
+
     def _scan_one_page(browser, url):
         """Scan a single page and return (url, page_data, new_links, elapsed) or None."""
         page_timer = time.time()
-        status = http_status(url)
+        status, content_type = http_status(url)
+
+        # Skip error pages (4xx/5xx) — server/Apache error pages,
+        # not application templates we can fix.
+        if status >= 400:
+            _vskip(url, "HTTP {}".format(status))
+            return None
+
+        # Skip non-HTML responses (JSON APIs, PDFs, etc.)
+        if content_type and content_type not in _HTML_TYPES:
+            _vskip(url, "not HTML ({})".format(content_type))
+            return None
 
         # Enforce cross-worker rate limit (from robots.txt crawl-delay)
         rate_limiter.wait()
@@ -1060,7 +1079,15 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                     len(page_html)))
                 return None
 
-            # Skip non-HTML responses
+            # Skip non-HTML responses — check both document.contentType
+            # (set by Chromium from the response headers) and the DOM.
+            # The HEAD pre-check may miss this if the server returns
+            # different headers for HEAD vs GET.
+            doc_ct = (browser.run_js(
+                "return document.contentType;") or '').lower()
+            if doc_ct and doc_ct not in _HTML_TYPES:
+                _vskip(url, "not HTML ({})".format(doc_ct))
+                return None
             page_start = (browser.run_js(
                 "return document.documentElement.outerHTML.substring(0, 80);") or '')
             if page_start and '<html' not in page_start.lower():
@@ -1245,8 +1272,16 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                         """Scan one URL — mirrors _scan_one_page."""
                         page_t0 = time.time()
                         loop = asyncio.get_event_loop()
-                        status = await loop.run_in_executor(
+                        status, content_type = await loop.run_in_executor(
                             None, http_status, url)
+                        if status >= 400:
+                            _vskip(url, "HTTP {}".format(status))
+                            return None
+                        if (content_type
+                                and content_type not in _HTML_TYPES):
+                            _vskip(url, "not HTML ({})".format(
+                                content_type))
+                            return None
                         page = await browser.new_page(
                             viewport={'width': 1280, 'height': 1024},
                             ignore_https_errors=ignore_certs)
@@ -1285,6 +1320,12 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                     len(content or '')))
                                 return None
 
+                            doc_ct = (await page.evaluate(
+                                "document.contentType") or '').lower()
+                            if doc_ct and doc_ct not in _HTML_TYPES:
+                                _vskip(url, "not HTML ({})".format(
+                                    doc_ct))
+                                return None
                             page_start = await page.evaluate(
                                 "document.documentElement.outerHTML"
                                 ".substring(0, 80)")

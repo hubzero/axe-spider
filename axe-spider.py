@@ -332,6 +332,12 @@ def load_config(config_path=None):
                             # Key with no value → start of a list
                             in_list = key
                             config[key] = []
+                        elif val.startswith('[') and val.endswith(']'):
+                            # Flow-syntax list: [a, b, c]
+                            in_list = None
+                            items = val[1:-1].split(',')
+                            config[key] = [
+                                i.strip() for i in items if i.strip()]
                         else:
                             # Simple scalar key: value
                             in_list = None
@@ -1536,6 +1542,20 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                 pass
                             active_wids.clear()
 
+                            # Refill the sliding window after restart
+                            for i in range(num_workers):
+                                if page_count + len(pending) >= max_pages:
+                                    break
+                                next_url = _next_url()
+                                if next_url is None:
+                                    break
+                                wid = i + 1
+                                active_wids.add(wid)
+                                t = asyncio.create_task(
+                                    _scan(next_url, worker_id=wid))
+                                pending[t] = next_url
+                                task_workers[t] = wid
+
                     try:
                         await browser.close()
                     except Exception:
@@ -1543,7 +1563,10 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
 
             try:
                 asyncio.run(_pw_sliding_window())
-            except (KeyboardInterrupt, SystemExit, Exception):
+            except (KeyboardInterrupt, SystemExit):
+                _cleanup_browsers()
+            except Exception as e:
+                print("  Playwright error: {}".format(e), file=sys.stderr)
                 _cleanup_browsers()
 
         else:

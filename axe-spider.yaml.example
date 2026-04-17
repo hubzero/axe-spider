@@ -43,12 +43,21 @@ exclude_paths:
 
 # Query parameters to strip from URLs during normalization.
 # Deduplicates sort/filter/pagination variants of the same page.
-# strip_query_params:
-#   - sort
-#   - limit
-#   - start
-#   - page
-#   - return
+# Plain strings are stripped globally; dicts with path (regex) + params
+# strip only on matching URL paths.
+strip_query_params:
+  - limit
+  - limitstart
+  - start
+  - sort
+  - sortby
+  - sortdir
+  - return
+  - filterby
+  - sharewith
+  # Path-conditional: strip 'parent' and 'area' only on /tags and /resources
+  # - path: ^/(tags|resources)
+  #   params: [parent, area]
 
 # Process priority — keep the scan from starving production services.
 # niceness: 0-19 (higher = lower priority, default 10; 0 to disable)

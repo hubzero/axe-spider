@@ -672,25 +672,35 @@ def create_browser(config=None):
 # pagination, sorting, and redirect params that produce the same page
 # template with different data.  Stripping them deduplicates the crawl
 # frontier so we don't scan /resources?sort=date AND /resources?sort=title.
-_strip_params = set()
+_strip_params = set()        # global params to strip from all URLs
+_strip_params_by_path = []   # list of (pattern, param_set) for path-conditional stripping
+
+
+_strip_path_rules_compiled = []  # compiled (regex, param_set) pairs
 
 
 def normalize_url(url):
     """Normalize URL for deduplication.
 
     Strips fragment, trailing slash, and any query parameters listed in
-    _strip_params (configured from strip_query_params in the YAML config).
+    _strip_params (global) or matching a path-conditional rule from
+    _strip_params_by_path.  Configured via strip_query_params in YAML.
     """
     parsed = urlparse(url)
     path = parsed.path.rstrip('/') or '/'
 
-    # Filter out stripped query parameters
+    # Build the set of params to strip for this URL
     query = parsed.query
-    if query and _strip_params:
+    if query and (_strip_params or _strip_path_rules_compiled):
         from urllib.parse import parse_qs, urlencode
-        params = parse_qs(query, keep_blank_values=True)
-        filtered = {k: v for k, v in params.items() if k not in _strip_params}
-        query = urlencode(filtered, doseq=True) if filtered else ''
+        strip = set(_strip_params)
+        for regex, param_set in _strip_path_rules_compiled:
+            if regex.search(path):
+                strip.update(param_set)
+        if strip:
+            params = parse_qs(query, keep_blank_values=True)
+            filtered = {k: v for k, v in params.items() if k not in strip}
+            query = urlencode(filtered, doseq=True) if filtered else ''
 
     return urlunparse((parsed.scheme, parsed.netloc, path, parsed.params, query, ''))
 
@@ -2638,11 +2648,28 @@ OTHER NOTES
 
     # Query parameters to strip from URLs during normalization.
     # This deduplicates sort/filter/pagination variants of the same page.
-    global _strip_params
+    # Entries can be plain strings (global) or dicts with path + params
+    # for path-conditional stripping.
+    global _strip_params, _strip_path_rules_compiled
     strip_list = config.get('strip_query_params', [])
     if isinstance(strip_list, str):
         strip_list = [s.strip() for s in strip_list.split(',')]
-    _strip_params = set(strip_list)
+    _strip_params = set()
+    _strip_path_rules_compiled = []
+    for entry in strip_list:
+        if isinstance(entry, str):
+            _strip_params.add(entry)
+        elif isinstance(entry, dict) and 'path' in entry:
+            params = entry.get('params', [])
+            if isinstance(params, str):
+                params = [p.strip() for p in params.split(',')]
+            try:
+                _strip_path_rules_compiled.append(
+                    (re.compile(entry['path']), set(params)))
+            except re.error as e:
+                print("WARNING: invalid strip_query_params path "
+                      "regex '{}': {}".format(entry['path'], e),
+                      file=sys.stderr)
 
     # Resolve output
     save_every = args.save_every or _safe_int(config.get('save_every', 25), 25)

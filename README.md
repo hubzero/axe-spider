@@ -69,6 +69,7 @@ Each scan produces:
 | `*.json` | Full axe-core results for every page (violations, incomplete, passes) |
 | `*.html` | Human-readable report with summary cards, WCAG criteria table, per-page details |
 | `*.jsonl` | Streaming results (one JSON object per line) — used for `--diff` and `--rescan` |
+| `*.state.json` | Crawl state (queue + visited URLs) — used for `--resume` to continue later |
 | `*.md` | LLM-optimized markdown summary (only with `--llm`) — ~300 tokens vs ~300K for JSON |
 
 ## Key flags
@@ -80,6 +81,7 @@ Each scan produces:
 | `--page` | Scan only the given URL, no crawling — fast single-page verify |
 | `--urls FILE` | Scan a specific list of URLs from a file (one per line) |
 | `--rescan PREV.jsonl` | Re-scan only pages that had issues in a previous scan |
+| `--resume STATE.json` | Resume a previous crawl from its saved state file |
 
 ### Performance
 | Flag | Description |
@@ -154,7 +156,11 @@ axe-spider.py --page -q --summary-json https://example.com/fixed-page
 # 4. Re-scan only pages that failed before, compare against baseline
 axe-spider.py --rescan baseline.jsonl --diff baseline.jsonl --llm
 
-# 5. Suppress known axe-core limitations in an allowlist
+# 5. Large site? Scan in chunks and resume
+axe-spider.py --max-pages 10000 https://example.com/
+axe-spider.py --max-pages 10000 --resume reports/scan.state.json https://example.com/
+
+# 6. Suppress known axe-core limitations in an allowlist
 echo '- rule: color-contrast
   url: /homepage
   reason: axe-core flex layout measurement limitation' >> allowlist.yaml

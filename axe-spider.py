@@ -865,7 +865,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                    verbose=False, quiet=False, config=None,
                    json_path=None, html_path=None, save_every=25,
                    level_label=None, allowlist=None, seed_urls=None,
-                   robots_parser=None):
+                   robots_parser=None, resume_state=None):
     """Crawl the site starting from start_url and scan each page with axe-core.
 
     If json_path is provided, results are flushed to disk every `save_every`
@@ -925,11 +925,21 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
         driver = create_browser(config)
     base_url = start_url
 
-    visited = set()
-    if seed_urls:
+    # Initialize crawl state — either from a saved state file (--resume)
+    # or from scratch.
+    if resume_state:
+        queue = deque(resume_state['queue'])
+        visited = set(resume_state['visited'])
+        no_crawl = False
+        if not quiet:
+            print("  Resuming: {} queued, {} already visited".format(
+                len(queue), len(visited)))
+    elif seed_urls:
+        visited = set()
         queue = deque(normalize_url(u) for u in seed_urls)
         no_crawl = True  # Don't follow links when using a URL list
     else:
+        visited = set()
         queue = deque([normalize_url(start_url)])
         no_crawl = False
     page_count = 0
@@ -1220,7 +1230,8 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                     _flush()
 
                 # Restart browser periodically to prevent memory leaks
-                if restart_every and page_count % restart_every == 0:
+                if (restart_every and page_count > 0
+                        and page_count % restart_every == 0):
                     if not quiet:
                         print("  [restarting browser after {} pages]".format(
                             page_count))
@@ -1725,6 +1736,24 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
             except Exception:
                 pass
         _flush(reason='final')
+
+        # Save crawl state so the scan can be resumed with --resume.
+        # Only useful for crawl mode (not --page or --urls).
+        if json_path and not no_crawl and queue:
+            state_path = json_path.replace('.json', '.state.json')
+            try:
+                with open(state_path, 'w') as f:
+                    json.dump({
+                        'queue': list(queue),
+                        'visited': sorted(visited),
+                        'start_url': start_url,
+                        'pages_scanned': page_count,
+                    }, f)
+                if not quiet:
+                    print("  Crawl state saved: {} ({} queued, {} visited)".format(
+                        state_path, len(queue), len(visited)))
+            except Exception as e:
+                print("  (state save failed: {})".format(e))
 
     wall_time = time.time() - scan_start_time
     return page_count, jsonl_path, wall_time, total_page_time
@@ -2352,6 +2381,8 @@ def main():
                         help='Scan URLs from a file (one per line) instead of crawling')
     parser.add_argument('--rescan', default=None, metavar='PREV.jsonl',
                         help='Re-scan only pages that had violations or incompletes in a previous scan')
+    parser.add_argument('--resume', default=None, metavar='STATE.json',
+                        help='Resume a previous crawl from its saved state file')
     parser.add_argument('--rule', action='append', default=None,
                         help='Only run specific axe rules (repeatable, e.g. --rule color-contrast)')
     group = parser.add_mutually_exclusive_group()
@@ -2596,6 +2627,19 @@ OTHER NOTES
     html_path = os.path.join(output_dir, basename + '.html')
     json_path = os.path.join(output_dir, basename + '.json')
 
+    # Load saved crawl state for --resume
+    resume_state = None
+    if args.resume:
+        try:
+            with open(args.resume) as f:
+                resume_state = json.load(f)
+            if not args.quiet:
+                print("Resuming from: {}".format(args.resume))
+        except Exception as e:
+            print("ERROR: cannot load state file: {}".format(e),
+                  file=sys.stderr)
+            sys.exit(2)
+
     scanned, jsonl_path, wall_time, total_page_time = crawl_and_scan(
         url,
         max_pages=max_pages,
@@ -2615,6 +2659,7 @@ OTHER NOTES
         allowlist=allowlist,
         seed_urls=seed_urls,
         robots_parser=robots_parser,
+        resume_state=resume_state,
     )
 
     # Final reports already flushed by crawl_and_scan

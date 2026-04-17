@@ -1614,7 +1614,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
 
                         # Restart browser periodically to prevent memory leaks.
                         # Wait for all in-flight pages to finish first.
-                        if (restart_every
+                        if (restart_every and page_count > 0
                                 and page_count % restart_every == 0
                                 and page_count < max_pages):
                             # Drain remaining in-flight tasks
@@ -1781,7 +1781,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                     # Restart all browsers periodically to prevent
                     # memory leaks.  Safe here because all futures from
                     # the current batch have completed.
-                    if (restart_every
+                    if (restart_every and page_count > 0
                             and page_count % restart_every == 0
                             and page_count < max_pages):
                         if not quiet:

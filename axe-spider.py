@@ -1006,6 +1006,12 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
     print_lock = threading.Lock()
     queue_lock = threading.Lock()
 
+    def _vskip(url, reason):
+        """Print a skip notice in verbose mode."""
+        if verbose and not quiet:
+            with print_lock:
+                print("  skip: {} — {}".format(url, reason))
+
     def _scan_one_page(browser, url):
         """Scan a single page and return (url, page_data, new_links, elapsed) or None."""
         page_timer = time.time()
@@ -1023,6 +1029,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
 
             # Redirected off-origin — skip
             if not is_same_origin(current, base_url):
+                _vskip(url, "redirect off-origin → {}".format(current))
                 return None
 
             # Same-origin redirect — use actual URL
@@ -1030,19 +1037,28 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
             with queue_lock:
                 if actual_url != url:
                     if actual_url in visited:
+                        _vskip(url, "redirect → {} (already visited)".format(
+                            actual_url))
                         return None
                     visited.add(actual_url)
+                    if verbose and not quiet:
+                        with print_lock:
+                            print("  redirect: {} → {}".format(
+                                url, actual_url))
                     url = actual_url
 
             # Skip empty pages
             page_html = (browser.page_source or '')
             if len(page_html) < 100:
+                _vskip(url, "empty response ({} bytes)".format(
+                    len(page_html)))
                 return None
 
             # Skip non-HTML responses
             page_start = (browser.run_js(
                 "return document.documentElement.outerHTML.substring(0, 80);") or '')
             if page_start and '<html' not in page_start.lower():
+                _vskip(url, "not HTML")
                 return None
 
             results = run_axe(browser, axe_source, tags, rules)
@@ -1050,6 +1066,11 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                 with print_lock:
                     print("  ERROR on {}: {}".format(url, results['error']))
                 return None
+
+            # Log non-200 status in verbose mode (page is still scanned)
+            if verbose and not quiet and status and status != 200:
+                with print_lock:
+                    print("  notice: {} — HTTP {}".format(url, status))
 
             violations = results.get('violations', [])
             incomplete = results.get('incomplete', [])
@@ -1238,15 +1259,24 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
 
                             current = page.url
                             if not is_same_origin(current, base_url):
+                                _vskip(url, "redirect off-origin → {}".format(
+                                    current))
                                 return None
                             actual = normalize_url(current)
                             if actual != url:
                                 if actual in visited:
+                                    _vskip(url, "redirect → {} (already visited)".format(
+                                        actual))
                                     return None
                                 visited.add(actual)
+                                if verbose and not quiet:
+                                    print("  redirect: {} → {}".format(
+                                        url, actual))
 
                             content = await page.content()
                             if len(content or '') < 100:
+                                _vskip(url, "empty response ({} bytes)".format(
+                                    len(content or '')))
                                 return None
 
                             page_start = await page.evaluate(
@@ -1254,6 +1284,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                 ".substring(0, 80)")
                             if page_start and '<html' not in (
                                     page_start or '').lower():
+                                _vskip(url, "not HTML")
                                 return None
 
                             await page.add_script_tag(
@@ -1265,7 +1296,16 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                             {error: e.toString()}));
                                 }""", run_opts)
                             if not results or 'error' in results:
+                                err = (results or {}).get(
+                                    'error', 'unknown error')
+                                _vskip(url, "axe error: {}".format(err))
                                 return None
+
+                            # Log non-200 status (page is still scanned)
+                            if (verbose and not quiet
+                                    and status and status != 200):
+                                print("  notice: {} — HTTP {}".format(
+                                    url, status))
 
                             new_links = []
                             is_ok = (status == 0 or status < 400)

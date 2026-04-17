@@ -57,7 +57,7 @@ strip_query_params:
   - sharewith
   # Path-conditional: strip 'parent' and 'area' only on /tags and /resources
   # - path: ^/(tags|resources)
-  #   params: [parent, area]
+  #   querystring: [parent, area]
 
 # Process priority — keep the scan from starving production services.
 # niceness: 0-19 (higher = lower priority, default 10; 0 to disable)

@@ -2660,7 +2660,7 @@ OTHER NOTES
         if isinstance(entry, str):
             _strip_params.add(entry)
         elif isinstance(entry, dict) and 'path' in entry:
-            params = entry.get('params', [])
+            params = entry.get('querystring', entry.get('params', []))
             if isinstance(params, str):
                 params = [p.strip() for p in params.split(',')]
             try:

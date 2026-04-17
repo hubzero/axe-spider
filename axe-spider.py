@@ -1147,23 +1147,59 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
     interrupted = False
 
     def _save_state(reason=''):
-        """Save crawl state (queue + visited) for --resume."""
+        """Save crawl state (queue + visited) for --resume.
+
+        Uses write-to-temp + verify + atomic rename to avoid
+        corrupting the state file on crash or disk-full.
+        """
         if not json_path or no_crawl or not queue:
             return
         state_path = json_path.replace('.json', '.state.json')
+        tmp_path = state_path + '.tmp'
+        old_path = state_path + '.old'
         try:
-            with open(state_path, 'w') as f:
-                json.dump({
-                    'queue': list(queue),
-                    'visited': sorted(visited),
-                    'start_url': start_url,
-                    'pages_scanned': page_count,
-                }, f)
+            state = {
+                'queue': list(queue),
+                'visited': sorted(visited),
+                'start_url': start_url,
+                'pages_scanned': page_count,
+            }
+
+            # Write to temp file
+            with open(tmp_path, 'w') as f:
+                json.dump(state, f)
+
+            # Verify: re-read and check key counts match
+            with open(tmp_path) as f:
+                check = json.load(f)
+            if (len(check.get('queue', [])) != len(state['queue'])
+                    or len(check.get('visited', [])) != len(state['visited'])):
+                raise ValueError(
+                    'verification failed: queue {}/{}, visited {}/{}'.format(
+                        len(check.get('queue', [])), len(state['queue']),
+                        len(check.get('visited', [])), len(state['visited'])))
+
+            # Rotate: current → .old, temp → current
+            if os.path.exists(state_path):
+                os.replace(state_path, old_path)
+            os.replace(tmp_path, state_path)
+
+            # Remove old only after new is safely in place
+            try:
+                os.unlink(old_path)
+            except OSError:
+                pass
+
             if not quiet:
                 print("  Crawl state saved: {} ({} queued, {} visited)".format(
                     state_path, len(queue), len(visited)))
         except Exception as e:
             print("  (state save failed: {})".format(e))
+            # Clean up temp on failure, leave current intact
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     # Signal handler sets the interrupted flag.  Each scan mode checks this
     # flag and breaks out of its loop.  We don't call sys.exit() here because

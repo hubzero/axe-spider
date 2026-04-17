@@ -994,7 +994,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
             if reason:
                 print('  [flushed {} pages ({})]'.format(page_count, reason))
         except Exception as e:
-            print('  (flush failed: {})'.format(str(e)[:80]))
+            print('  (flush failed: {})'.format(e))
 
     # Rate limiter shared across all workers to enforce robots.txt crawl delay.
     # This is separate from page_wait (which is per-worker JS settle time).
@@ -1345,7 +1345,10 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                         except Exception:
                             return None
                         finally:
-                            await page.close()
+                            try:
+                                await page.close()
+                            except Exception:
+                                pass
 
                     def _next_url():
                         """Pull the next scannable URL from the queue."""
@@ -1555,6 +1558,17 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                     _scan(next_url, worker_id=wid))
                                 pending[t] = next_url
                                 task_workers[t] = wid
+
+                    # Cancel any in-flight tasks (e.g. after ^C) so
+                    # Python doesn't dump "Task exception was never
+                    # retrieved" tracebacks at shutdown.
+                    for task in list(pending.keys()):
+                        task.cancel()
+                    for task in list(pending.keys()):
+                        try:
+                            await task
+                        except (asyncio.CancelledError, Exception):
+                            pass
 
                     try:
                         await browser.close()

@@ -2361,8 +2361,9 @@ def main():
                         help='Ignore exclude_paths from config file')
     parser.add_argument('--ignore-robots', action='store_true',
                         help='Ignore robots.txt (by default, disallowed paths are skipped)')
-    parser.add_argument('--output', default=None,
-                        help='Output file basename (default: axe-spider-YYYY-MM-DD-HHMMSS)')
+    parser.add_argument('--name', '--output', default=None, dest='output',
+                        help='Job name used as the basename for all output files '
+                             '(default: axe-spider-YYYY-MM-DD-HHMMSS)')
     parser.add_argument('--output-dir', default=None,
                         help='Output directory (default: from config or current directory)')
     parser.add_argument('--allowlist', default=None,

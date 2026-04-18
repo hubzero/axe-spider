@@ -795,6 +795,9 @@ def should_scan(url, base_url, include_paths, exclude_paths, exclude_regex=None,
     return True
 
 
+_http_cookie_header = ''  # set by crawl_and_scan when auth cookies loaded
+
+
 def http_status(url, timeout=10):
     """Return (status_code, content_type) via a lightweight HEAD request.
 
@@ -806,15 +809,21 @@ def http_status(url, timeout=10):
     It's much cheaper than a full browser load and lets us identify
     error pages (4xx/5xx) and non-HTML responses (application/json)
     without wasting Chromium resources.
+
+    If auth cookies are loaded, they are sent with the request so
+    authenticated pages return 200 instead of 302→login.
     """
     def _ct(r):
         """Extract base content-type (without charset)."""
         ct = r.headers.get('Content-Type', '')
         return ct.split(';')[0].strip().lower()
 
+    headers = {'User-Agent': 'axe-spider/1.0'}
+    if _http_cookie_header:
+        headers['Cookie'] = _http_cookie_header
+
     try:
-        req = urllib.request.Request(url, method='HEAD',
-                                     headers={'User-Agent': 'axe-spider/1.0'})
+        req = urllib.request.Request(url, method='HEAD', headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return (r.status, _ct(r))
     except urllib.error.HTTPError as e:
@@ -822,8 +831,7 @@ def http_status(url, timeout=10):
     except Exception:
         # HEAD failed (connection error, or server rejects HEAD) — try GET
         try:
-            req = urllib.request.Request(url, method='GET',
-                                         headers={'User-Agent': 'axe-spider/1.0'})
+            req = urllib.request.Request(url, method='GET', headers=headers)
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return (r.status, _ct(r))
         except urllib.error.HTTPError as e:
@@ -942,6 +950,15 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
     axe_source = load_axe_source()
     num_workers = _safe_int(config.get('workers', 1), 1)
     driver_type = config.get('driver', 'selenium').lower()
+
+    # Set up auth cookie header for http_status() pre-checks.
+    # Without this, authenticated pages return 302→login to the HEAD
+    # request and get skipped before the browser ever loads them.
+    global _http_cookie_header
+    _auth_cookies = load_cookies(config)
+    if _auth_cookies:
+        _http_cookie_header = '; '.join(
+            '{}={}'.format(c['name'], c['value']) for c in _auth_cookies)
 
     # For Playwright with multiple workers, we skip creating the sync browser
     # entirely and go straight to async batch mode (sync and async Playwright
@@ -1383,19 +1400,62 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                     except Exception:
                         pass
 
-                    # Inject auth cookies into the browser context
-                    _pw_auth_cookies = inject_cookies_playwright(
-                        None, load_cookies(config))
-                    if _pw_auth_cookies:
-                        context = await browser.new_context(
-                            viewport={'width': 1280, 'height': 1024},
-                            ignore_https_errors=ignore_certs)
-                        await context.add_cookies(_pw_auth_cookies)
-                        if not quiet:
-                            print("  Loaded {} auth cookies (Playwright)".format(
-                                len(_pw_auth_cookies)))
+                    # Authenticate if configured — login in-process so
+                    # session cookies are never serialized/deserialized.
+                    auth = config.get('auth', {})
+                    cred_file = auth.get('credentials_file', '')
+                    if cred_file:
+                        cred_path = os.path.expanduser(cred_file)
+                        if os.path.isfile(cred_path):
+                            with open(cred_path) as _cf:
+                                _cred = _cf.read().strip()
+                            if ':' in _cred.split('\n')[0]:
+                                _u, _p = _cred.split('\n')[0].split(':', 1)
+                            else:
+                                _lines = _cred.split('\n')
+                                _u, _p = _lines[0].strip(), _lines[1].strip()
+
+                            login_url = start_url.rstrip('/') + auth.get('login_url', '/login')
+                            context = await browser.new_context(
+                                viewport={'width': 1280, 'height': 1024},
+                                ignore_https_errors=ignore_certs)
+                            _lp = await context.new_page()
+                            await _lp.goto(login_url, wait_until='load')
+                            await _lp.wait_for_timeout(2000)
+                            # HubZero: click local login link to reveal form
+                            _local = await _lp.query_selector('text=Sign in with your')
+                            if _local:
+                                await _local.click()
+                                await _lp.wait_for_timeout(1000)
+                            # Fill and submit — try password field first (always visible)
+                            _pf = await _lp.query_selector('input[type="password"]')
+                            if _pf:
+                                # Find username field near the password field
+                                _uf = await _lp.query_selector(
+                                    'input[name="username"], input[name="user"], '
+                                    'input[name="email"], input[type="email"], '
+                                    'input[name="login"]')
+                                if _uf:
+                                    await _uf.click()
+                                    await _lp.keyboard.type(_u.strip())
+                                    await _pf.click()
+                                    await _lp.keyboard.type(_p.strip())
+                                    await _lp.keyboard.press('Enter')
+                                    await _lp.wait_for_timeout(5000)
+                            _logged_in = '/login' not in _lp.url
+                            await _lp.close()
+                            if _logged_in:
+                                if not quiet:
+                                    print("  Authenticated as {}".format(_u.strip()))
+                            else:
+                                if not quiet:
+                                    print("  Login failed — scanning as anonymous")
+                                await context.close()
+                                context = None
+                        else:
+                            context = None
                     else:
-                        context = None  # use browser.new_page() default
+                        context = None  # no auth configured
 
                     async def _scan(url, worker_id=0,
                                     skip_rate_limit=False):

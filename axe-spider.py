@@ -978,13 +978,20 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
 
     # Initialize crawl state — either from a saved state file (--resume)
     # or from scratch.
+    # URLs that cause session logout — discovered during recovery mode,
+    # persisted in state files.
+    _logout_urls = set()
+
     if resume_state:
         queue = deque(resume_state['queue'])
         visited = set(resume_state['visited'])
+        _logout_urls = set(resume_state.get('logout_urls', []))
         no_crawl = False
         if not quiet:
             print("  Resuming: {} queued, {} already visited".format(
                 len(queue), len(visited)))
+            if _logout_urls:
+                print("  {} banned logout URLs".format(len(_logout_urls)))
     elif seed_urls:
         visited = set()
         queue = deque(normalize_url(u) for u in seed_urls)
@@ -1214,6 +1221,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                 'visited': sorted(visited),
                 'start_url': start_url,
                 'pages_scanned': page_count,
+                'logout_urls': sorted(_logout_urls),
             }
 
             # Write to temp file
@@ -1400,66 +1408,54 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                     except Exception:
                         pass
 
-                    # Authenticate if configured — login in-process so
-                    # session cookies are never serialized/deserialized.
+                    # Authenticate if a login_script plugin is configured.
+                    # The plugin is a Python file with an async login(context, config)
+                    # function that drives the browser to log in.
                     auth = config.get('auth', {})
-                    cred_file = auth.get('credentials_file', '')
-                    if cred_file:
-                        cred_path = os.path.expanduser(cred_file)
-                        if os.path.isfile(cred_path):
-                            with open(cred_path) as _cf:
-                                _cred = _cf.read().strip()
-                            if ':' in _cred.split('\n')[0]:
-                                _u, _p = _cred.split('\n')[0].split(':', 1)
-                            else:
-                                _lines = _cred.split('\n')
-                                _u, _p = _lines[0].strip(), _lines[1].strip()
+                    login_script = auth.get('login_script', '')
+                    context = None
+                    _login_plugin = None
+                    _recovery_mode = asyncio.Event()
+                    _recovery_done = asyncio.Event()
+                    _suspect_urls = []
+                    if login_script:
+                        script_path = os.path.expanduser(login_script)
+                        if not os.path.isabs(script_path):
+                            script_path = os.path.join(SCRIPT_DIR, script_path)
+                        if os.path.isfile(script_path):
+                            import importlib.util
+                            spec = importlib.util.spec_from_file_location(
+                                'login_plugin', script_path)
+                            _login_plugin = importlib.util.module_from_spec(spec)
+                            spec.loader.exec_module(_login_plugin)
 
-                            login_url = start_url.rstrip('/') + auth.get('login_url', '/login')
                             context = await browser.new_context(
                                 viewport={'width': 1280, 'height': 1024},
                                 ignore_https_errors=ignore_certs)
-                            _lp = await context.new_page()
-                            await _lp.goto(login_url, wait_until='load')
-                            await _lp.wait_for_timeout(2000)
-                            # HubZero: click local login link to reveal form
-                            _local = await _lp.query_selector('text=Sign in with your')
-                            if _local:
-                                await _local.click()
-                                await _lp.wait_for_timeout(1000)
-                            # Fill and submit — try password field first (always visible)
-                            _pf = await _lp.query_selector('input[type="password"]')
-                            if _pf:
-                                # Find username field near the password field
-                                _uf = await _lp.query_selector(
-                                    'input[name="username"], input[name="user"], '
-                                    'input[name="email"], input[type="email"], '
-                                    'input[name="login"]')
-                                if _uf:
-                                    await _uf.click()
-                                    await _lp.keyboard.type(_u.strip())
-                                    await _pf.click()
-                                    await _lp.keyboard.type(_p.strip())
-                                    await _lp.keyboard.press('Enter')
-                                    await _lp.wait_for_timeout(5000)
-                            _logged_in = '/login' not in _lp.url
-                            await _lp.close()
-                            if _logged_in:
+                            try:
+                                success = await _login_plugin.login(
+                                    context, config)
+                            except Exception as e:
                                 if not quiet:
-                                    print("  Authenticated as {}".format(_u.strip()))
-                            else:
+                                    print("  Login error: {}".format(e))
+                                success = False
+                            if not success:
                                 if not quiet:
                                     print("  Login failed — scanning as anonymous")
                                 await context.close()
                                 context = None
                         else:
-                            context = None
-                    else:
-                        context = None  # no auth configured
+                            if not quiet:
+                                print("  Login script not found: {}".format(
+                                    script_path))
 
                     async def _scan(url, worker_id=0,
                                     skip_rate_limit=False):
                         """Scan one URL — mirrors _scan_one_page."""
+                        # If in recovery mode, wait for recovery to finish
+                        if _recovery_mode.is_set():
+                            await _recovery_done.wait()
+
                         page_t0 = time.time()
                         loop = asyncio.get_event_loop()
                         status, content_type = await loop.run_in_executor(
@@ -1490,6 +1486,19 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                             await page.goto(url, wait_until='load')
                             await page.wait_for_timeout(
                                 page_wait * 1000)
+
+                            # Check if session is still active.
+                            # If lost, add this URL to suspects and
+                            # trigger recovery mode.
+                            if (_login_plugin
+                                    and hasattr(_login_plugin, 'is_logged_in')
+                                    and not await _login_plugin.is_logged_in(page)):
+                                _suspect_urls.append(url)
+                                visited.discard(url)
+                                if not _recovery_mode.is_set():
+                                    _recovery_mode.set()
+                                    _recovery_done.clear()
+                                return None
 
                             current = page.url
                             if not is_same_origin(current, base_url):
@@ -1584,16 +1593,22 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                             except Exception:
                                 pass
 
+                    # Merge plugin exclude_paths into the scan filter
+                    _all_exclude = list(exclude_paths or [])
+                    if (_login_plugin
+                            and hasattr(_login_plugin, 'exclude_paths')):
+                        _all_exclude.extend(_login_plugin.exclude_paths)
+
                     def _next_url():
                         """Pull the next scannable URL from the queue."""
                         while queue:
                             url = queue.popleft()
-                            if url in visited:
+                            if url in visited or url in _logout_urls:
                                 continue
                             visited.add(url)
                             if should_scan(
                                     url, base_url, include_paths,
-                                    exclude_paths, exclude_regex,
+                                    _all_exclude, exclude_regex,
                                     robots_parser):
                                 return url
                         return None
@@ -1706,6 +1721,86 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                                         queue.append(link)
                             else:
                                 page_count -= 1
+
+                        # Recovery mode: drain all workers, re-login,
+                        # test suspect URLs serially, then resume.
+                        if _recovery_mode.is_set() and _login_plugin and context:
+                            # Drain remaining in-flight tasks
+                            while pending:
+                                d2, _ = await asyncio.wait(
+                                    pending.keys(),
+                                    return_when=asyncio.FIRST_COMPLETED)
+                                for t2 in d2:
+                                    del pending[t2]
+                                    task_workers.pop(t2, None)
+                                    try:
+                                        r2 = t2.result()
+                                    except Exception:
+                                        r2 = None
+                                    if r2 is not None:
+                                        page_count += 1
+                                        u2, pd2, nl2, _, el2 = r2
+                                        total_page_time += el2
+                                        _write_page(u2, pd2)
+                                        for lnk in nl2:
+                                            if (lnk not in visited
+                                                    and lnk not in queue):
+                                                queue.append(lnk)
+                            active_wids.clear()
+
+                            if not quiet:
+                                print("  [recovery: {} suspect URLs, re-logging in]".format(
+                                    len(_suspect_urls)))
+
+                            # Re-login
+                            try:
+                                await _login_plugin.login(context, config)
+                            except Exception:
+                                pass
+
+                            # Test each suspect URL serially
+                            safe_urls = []
+                            for surl in list(_suspect_urls):
+                                p = await context.new_page()
+                                try:
+                                    await p.goto(surl, wait_until='load')
+                                    await p.wait_for_timeout(2000)
+                                    still_ok = await _login_plugin.is_logged_in(p)
+                                    if still_ok:
+                                        safe_urls.append(surl)
+                                    else:
+                                        # This URL caused logout
+                                        _logout_urls.add(surl)
+                                        if not quiet:
+                                            print("  [banned: {}]".format(surl))
+                                        # Re-login for next test
+                                        await p.close()
+                                        try:
+                                            await _login_plugin.login(
+                                                context, config)
+                                        except Exception:
+                                            pass
+                                        continue
+                                except Exception:
+                                    safe_urls.append(surl)
+                                finally:
+                                    try:
+                                        await p.close()
+                                    except Exception:
+                                        pass
+
+                            # Requeue safe URLs
+                            for surl in safe_urls:
+                                if surl not in visited:
+                                    queue.appendleft(surl)
+                            _suspect_urls.clear()
+
+                            _recovery_mode.clear()
+                            _recovery_done.set()
+
+                            if not quiet:
+                                print("  [recovery done: {} banned, {} requeued]".format(
+                                    len(_logout_urls), len(safe_urls)))
 
                         # Fill empty slots with freed worker IDs first,
                         # then allocate new ones if needed.

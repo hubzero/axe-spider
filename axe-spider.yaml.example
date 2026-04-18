@@ -75,12 +75,13 @@ oom_score_adj: 1000
 # llm_instructions: llm-instructions.md
 
 # Authentication — scan as a logged-in user to reach member-only pages.
-# Credentials are in a separate file (not committed to git).
+# login_script is a Python file with: async def login(context, config) -> bool
+# The script receives a Playwright BrowserContext and drives the login flow.
+# See login-hubzero.py for an example.
 # auth:
-#   credentials_file: ~/.axe-spider-creds   # username:password or two lines
-#   login_url: /login                        # path to the login form
-#   login_check: /members/myaccount          # URL that 200s when logged in
-#   cookies_file: cookies.json               # saved session cookies
+#   login_script: login-hubzero.py             # login plugin (site-specific)
+#   credentials_file: ~/.axe-spider-creds      # username:password or two lines
+#   login_url: /login                           # passed to plugin via config
 
 # Ignore robots.txt restrictions (default: obey robots.txt)
 # ignore_robots: true

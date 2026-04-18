@@ -46,8 +46,15 @@ from datetime import datetime
 from urllib.parse import urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
 
-# Selenium is the only external dependency.  We catch ImportError here
-# rather than letting Python's traceback confuse users who haven't installed it.
+# Required dependencies.  Catch ImportError here rather than letting
+# Python's traceback confuse users who haven't installed them.
+try:
+    import yaml
+except ImportError:
+    print("ERROR: PyYAML is not installed.", file=sys.stderr)
+    print("  Install it with:  pip install pyyaml", file=sys.stderr)
+    sys.exit(2)
+
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
@@ -232,35 +239,10 @@ def load_allowlist(path):
     if not path or not os.path.exists(path):
         return []
     entries = []
-    try:
-        import yaml
-        with open(path) as f:
-            data = yaml.safe_load(f) or []
-        if isinstance(data, list):
-            entries = data
-    except ImportError:
-        # PyYAML not installed — fall back to a minimal parser that handles
-        # the subset of YAML we use: a flat list of key:value dicts.
-        # Each "- key: value" starts a new dict entry.  This covers the
-        # allowlist format but won't handle nested structures.
-        with open(path) as f:
-            current = {}
-            for line in f:
-                line = line.rstrip()
-                stripped = line.lstrip()
-                if not stripped or stripped.startswith('#'):
-                    continue
-                # "- " marks the start of a new list item
-                if stripped.startswith('- '):
-                    if current:
-                        entries.append(current)
-                    current = {}
-                    stripped = stripped[2:]
-                if ':' in stripped:
-                    key, _, val = stripped.partition(':')
-                    current[key.strip()] = val.strip()
-            if current:
-                entries.append(current)
+    with open(path) as f:
+        data = yaml.safe_load(f) or []
+    if isinstance(data, list):
+        entries = data
     return entries
 
 
@@ -304,46 +286,8 @@ def load_config(config_path=None):
     config = {}
     path = config_path or DEFAULT_CONFIG_PATH
     if os.path.exists(path):
-        try:
-            import yaml
-            with open(path) as f:
-                config = yaml.safe_load(f) or {}
-        except ImportError:
-            # PyYAML not installed — fall back to a minimal parser that handles
-            # the subset of YAML our config files use: scalar "key: value" pairs
-            # and simple lists of strings ("- item" lines under a key with no value).
-            # This won't handle nested dicts, multi-line values, or flow syntax.
-            with open(path) as f:
-                in_list = None  # tracks which key we're appending list items to
-                for line in f:
-                    line = line.rstrip()
-                    stripped = line.lstrip()
-                    if not stripped or stripped.startswith('#'):
-                        continue
-                    # "- item" under a list key → append to that key's list
-                    if stripped.startswith('- ') and in_list:
-                        config.setdefault(in_list, []).append(stripped[2:].strip())
-                        continue
-                    if ':' in stripped:
-                        key, _, val = stripped.partition(':')
-                        key = key.strip()
-                        val = val.strip()
-                        if val == '' or val == '[]':
-                            # Key with no value → start of a list
-                            in_list = key
-                            config[key] = []
-                        elif val.startswith('[') and val.endswith(']'):
-                            # Flow-syntax list: [a, b, c]
-                            in_list = None
-                            items = val[1:-1].split(',')
-                            config[key] = [
-                                i.strip() for i in items if i.strip()]
-                        else:
-                            # Simple scalar key: value
-                            in_list = None
-                            config[key] = val
-                    else:
-                        in_list = None
+        with open(path) as f:
+            config = yaml.safe_load(f) or {}
     return config
 
 
@@ -664,9 +608,11 @@ def load_cookies(config):
     auth = config.get('auth', {})
     if not auth:
         return []
-    cookies_file = os.path.expanduser(
-        auth.get('cookies_file', ''))
-    if not cookies_file or not os.path.isfile(cookies_file):
+    cookies_file = auth.get('cookies_file', '')
+    if not cookies_file:
+        return []
+    cookies_file = os.path.expanduser(cookies_file)
+    if not os.path.isfile(cookies_file):
         return []
     try:
         with open(cookies_file) as f:

@@ -653,6 +653,226 @@ class PlaywrightBrowser:
             pass
 
 
+def auto_login(browser, config, quiet=False):
+    """Automatically log in by finding and filling the login form.
+
+    Reads credentials from the credentials_file, navigates to the
+    login URL, detects the form fields, fills them, submits, and
+    verifies by checking login_check URL.  Handles common form
+    layouts: username+password, email+password, etc.
+
+    Returns True on success, False on failure.
+    """
+    auth = config.get('auth', {})
+    if not auth:
+        return False
+    cred_path = os.path.expanduser(auth.get('credentials_file', ''))
+    if not cred_path or not os.path.isfile(cred_path):
+        if not quiet:
+            print("  No credentials file: {}".format(cred_path))
+        return False
+
+    # Read credentials — username:password or two lines
+    try:
+        with open(cred_path) as f:
+            content = f.read().strip()
+        if ':' in content.split('\n')[0]:
+            parts = content.split('\n')[0].split(':', 1)
+            username, password = parts[0].strip(), parts[1].strip()
+        else:
+            lines = content.split('\n')
+            username, password = lines[0].strip(), lines[1].strip()
+    except Exception as e:
+        if not quiet:
+            print("  Cannot read credentials: {}".format(e))
+        return False
+
+    base_url = config.get('url', '').rstrip('/')
+    login_path = auth.get('login_url', '/login')
+    login_url = base_url + login_path
+    login_check = auth.get('login_check', '')
+
+    if not quiet:
+        print("  Logging in as {} at {}...".format(username, login_url))
+
+    try:
+        browser.navigate(login_url)
+        time.sleep(3)
+
+        # Detect and fill the login form
+        result = browser.run_js("""
+            var user = arguments[0], pass = arguments[1];
+
+            // Find username/email field — try many selectors
+            var uSelectors = [
+                'input[name="username"]', 'input[name="user"]',
+                'input[name="email"]', 'input[id="username"]',
+                'input[id="user"]', 'input[id="email"]',
+                'input[type="email"]',
+                'input[name="login"]', 'input[id="login"]',
+                'input[autocomplete="username"]',
+                'form input[type="text"]:first-of-type'
+            ];
+            var uField = null;
+            for (var i = 0; i < uSelectors.length; i++) {
+                uField = document.querySelector(uSelectors[i]);
+                if (uField && uField.offsetHeight > 0) break;
+                uField = null;
+            }
+
+            // Find password field
+            var pField = document.querySelector(
+                'input[type="password"]');
+
+            if (!uField) return 'no_username_field';
+            if (!pField) return 'no_password_field';
+
+            // Fill using native input setter to trigger React/Vue bindings
+            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value').set;
+            nativeInputValueSetter.call(uField, user);
+            uField.dispatchEvent(new Event('input', {bubbles: true}));
+            uField.dispatchEvent(new Event('change', {bubbles: true}));
+
+            nativeInputValueSetter.call(pField, pass);
+            pField.dispatchEvent(new Event('input', {bubbles: true}));
+            pField.dispatchEvent(new Event('change', {bubbles: true}));
+
+            // Find and click submit button, or submit the form
+            var submit = pField.closest('form')
+                ? pField.closest('form').querySelector(
+                    'input[type="submit"], button[type="submit"], '
+                    + 'button:not([type])')
+                : null;
+            if (submit) {
+                submit.click();
+                return 'clicked_submit';
+            }
+            var form = pField.closest('form');
+            if (form) {
+                form.submit();
+                return 'submitted_form';
+            }
+            return 'no_form';
+        """, [username, password])
+
+        if result.startswith('no_'):
+            if not quiet:
+                print("  Login failed: {}".format(result))
+            return False
+
+        time.sleep(4)  # Wait for post-login redirect
+
+        # Verify login by checking a protected URL
+        if login_check:
+            check_url = base_url + login_check
+            browser.navigate(check_url)
+            time.sleep(2)
+            current = browser.current_url
+            if login_path in current or '/login' in current:
+                if not quiet:
+                    print("  Login failed: redirected back to login")
+                return False
+
+        if not quiet:
+            print("  Authenticated as {}".format(username))
+        return True
+
+    except Exception as e:
+        if not quiet:
+            print("  Login error: {}".format(str(e)[:100]))
+        return False
+
+
+def save_cookies(browser, config, quiet=False):
+    """Save browser cookies to the cookies file for session persistence."""
+    auth = config.get('auth', {})
+    cookies_file = os.path.expanduser(
+        auth.get('cookies_file', 'cookies.json'))
+    try:
+        cookies = browser._driver.get_cookies()
+        with open(cookies_file, 'w') as f:
+            json.dump(cookies, f, indent=2)
+        if not quiet:
+            print("  Saved {} cookies to {}".format(
+                len(cookies), cookies_file))
+        return True
+    except Exception as e:
+        if not quiet:
+            print("  Cookie save failed: {}".format(e))
+        return False
+
+
+def load_cookies(config):
+    """Load cookies from the cookies file.
+
+    Returns a list of cookie dicts, or an empty list if not configured
+    or file doesn't exist.
+    """
+    auth = config.get('auth', {})
+    if not auth:
+        return []
+    cookies_file = os.path.expanduser(
+        auth.get('cookies_file', ''))
+    if not cookies_file or not os.path.isfile(cookies_file):
+        return []
+    try:
+        with open(cookies_file) as f:
+            cookies = json.load(f)
+        return cookies if isinstance(cookies, list) else []
+    except Exception:
+        return []
+
+
+def inject_cookies_selenium(driver, cookies, base_url):
+    """Inject saved cookies into a Selenium browser session."""
+    if not cookies:
+        return
+    # Navigate to the domain first so cookies can be set
+    driver.navigate(base_url)
+    for cookie in cookies:
+        # Selenium needs specific format — strip Playwright-specific keys
+        c = {}
+        for key in ('name', 'value', 'domain', 'path', 'secure', 'httpOnly'):
+            if key in cookie:
+                c[key] = cookie[key]
+        if 'expires' in cookie:
+            c['expiry'] = int(cookie['expires']) if cookie['expires'] else None
+        if 'sameSite' in cookie:
+            val = cookie['sameSite']
+            if val in ('Strict', 'Lax', 'None'):
+                c['sameSite'] = val
+        try:
+            driver._driver.add_cookie(c)
+        except Exception:
+            pass
+
+
+def inject_cookies_playwright(context, cookies):
+    """Inject saved cookies into a Playwright browser context (async)."""
+    if not cookies:
+        return []
+    # Playwright cookies need 'name', 'value', 'url' or 'domain'+'path'
+    clean = []
+    for c in cookies:
+        entry = {
+            'name': c.get('name', ''),
+            'value': c.get('value', ''),
+            'domain': c.get('domain', ''),
+            'path': c.get('path', '/'),
+        }
+        if 'secure' in c:
+            entry['secure'] = c['secure']
+        if 'httpOnly' in c:
+            entry['httpOnly'] = c['httpOnly']
+        if 'expires' in c and c['expires']:
+            entry['expires'] = float(c['expires'])
+        if 'sameSite' in c and c['sameSite'] in ('Strict', 'Lax', 'None'):
+            entry['sameSite'] = c['sameSite']
+        clean.append(entry)
+    return clean
+
+
 def create_browser(config=None):
     """Create a browser instance based on the 'driver' config setting.
 
@@ -933,6 +1153,15 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
         driver = None  # no sync browser — async sliding window creates its own
     else:
         driver = create_browser(config)
+        # Authenticate if configured
+        auth_cookies = load_cookies(config)
+        if auth_cookies:
+            inject_cookies_selenium(driver, auth_cookies, start_url)
+            if not quiet:
+                print("  Loaded {} auth cookies".format(len(auth_cookies)))
+        elif config.get('auth', {}).get('credentials_file'):
+            if auto_login(driver, config, quiet):
+                save_cookies(driver, config, quiet)
     base_url = start_url
 
     # Initialize crawl state — either from a saved state file (--resume)
@@ -1316,6 +1545,13 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                     except Exception:
                         pass
                     driver = create_browser(config)
+                    # Re-authenticate after restart
+                    auth_cookies = load_cookies(config)
+                    if auth_cookies:
+                        inject_cookies_selenium(
+                            driver, auth_cookies, start_url)
+                    elif config.get('auth', {}).get('credentials_file'):
+                        auto_login(driver, config, quiet=True)
 
         elif is_playwright and num_workers > 1:
             # --- Playwright parallel: async sliding window ---
@@ -1354,6 +1590,19 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                     except Exception:
                         pass
 
+                    # Inject auth cookies into the browser context
+                    _pw_auth_cookies = inject_cookies_playwright(
+                        None, load_cookies(config))
+                    if _pw_auth_cookies:
+                        context = await browser.new_context(
+                            ignore_https_errors=ignore_certs)
+                        await context.add_cookies(_pw_auth_cookies)
+                        if not quiet:
+                            print("  Loaded {} auth cookies (Playwright)".format(
+                                len(_pw_auth_cookies)))
+                    else:
+                        context = None  # use browser.new_page() default
+
                     async def _scan(url, worker_id=0,
                                     skip_rate_limit=False):
                         """Scan one URL — mirrors _scan_one_page."""
@@ -1369,7 +1618,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                             _vskip(url, "not HTML ({})".format(
                                 content_type))
                             return None
-                        page = await browser.new_page(
+                        page = await (context or browser).new_page(
                             viewport={'width': 1280, 'height': 1024},
                             ignore_https_errors=ignore_certs)
                         try:
@@ -2458,12 +2707,28 @@ def main():
                         help='Suppress per-page progress, only show final summary')
     parser.add_argument('--help-audit', action='store_true',
                         help='Print a guide for using this tool to perform a WCAG audit')
+    parser.add_argument('--login', action='store_true',
+                        help='Log in before scanning. Reads credentials from '
+                             'auth.credentials_file, saves cookies for session '
+                             'persistence across browser restarts.')
     parser.add_argument('--cleanup', action='store_true',
                         help='Kill orphaned chromium/chromedriver processes from previous runs and exit')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Show detailed rule/node counts for pages with issues')
 
     args = parser.parse_args()
+
+    config = load_config(args.config)
+
+    if args.login and not args.page and not args.crawl:
+        # Standalone --login: just authenticate and save cookies, then exit
+        browser = create_browser(config)
+        if auto_login(browser, config):
+            save_cookies(browser, config)
+        else:
+            print("Login failed", file=sys.stderr)
+        browser.quit()
+        sys.exit(0)
 
     if args.cleanup:
         # Kill any orphaned chromium/chromedriver processes owned by this user

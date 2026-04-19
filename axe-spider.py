@@ -798,12 +798,22 @@ def should_scan(url, base_url, include_paths, exclude_paths, exclude_regex=None,
 _http_cookie_header = ''  # set by crawl_and_scan when auth cookies loaded
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Handler that stops urllib from following redirects."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_no_redirect_opener = urllib.request.build_opener(_NoRedirect)
+
+
 def http_status(url, timeout=10):
     """Return (status_code, content_type) via a lightweight HEAD request.
 
     Falls back to GET if the server rejects HEAD (some do).
-    Returns (0, '') on network error.  Follows redirects — the returned
-    status reflects the final response, not intermediate 3xx hops.
+    Returns (0, '') on network error.  Does NOT follow redirects —
+    redirects return the 3xx status so the browser can handle them
+    with its own session cookies.
 
     This is used as a pre-check before loading pages in Chromium.
     It's much cheaper than a full browser load and lets us identify
@@ -824,18 +834,18 @@ def http_status(url, timeout=10):
 
     try:
         req = urllib.request.Request(url, method='HEAD', headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _no_redirect_opener.open(req, timeout=timeout) as r:
             return (r.status, _ct(r))
     except urllib.error.HTTPError as e:
-        return (e.code, '')
+        return (e.code, _ct(e))
     except Exception:
         # HEAD failed (connection error, or server rejects HEAD) — try GET
         try:
             req = urllib.request.Request(url, method='GET', headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with _no_redirect_opener.open(req, timeout=timeout) as r:
                 return (r.status, _ct(r))
         except urllib.error.HTTPError as e:
-            return (e.code, '')
+            return (e.code, _ct(e))
         except Exception:
             return (0, '')
 
@@ -1873,6 +1883,36 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                             except Exception:
                                 pass
                             active_wids.clear()
+
+                            # Re-authenticate after browser restart
+                            if _login_plugin:
+                                context = await browser.new_context(
+                                    viewport={'width': 1280,
+                                              'height': 1024},
+                                    ignore_https_errors=ignore_certs)
+                                try:
+                                    success = await _login_plugin.login(
+                                        context, config)
+                                    if success:
+                                        # Update cookie header for
+                                        # HTTP pre-checks
+                                        cookies = (
+                                            await context.cookies())
+                                        if cookies:
+                                            global _http_cookie_header
+                                            _http_cookie_header = (
+                                                '; '.join(
+                                                    '{}={}'.format(
+                                                        c['name'],
+                                                        c['value'])
+                                                    for c in cookies))
+                                    elif not quiet:
+                                        print("  [re-login failed"
+                                              " after restart]")
+                                except Exception as e:
+                                    if not quiet:
+                                        print("  [re-login error: {}]"
+                                              .format(e))
 
                             # Refill the sliding window after restart
                             for i in range(num_workers):

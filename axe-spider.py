@@ -973,7 +973,13 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
     # For Playwright with multiple workers, we skip creating the sync browser
     # entirely and go straight to async batch mode (sync and async Playwright
     # can't coexist in the same process).
-    use_playwright_async = (driver_type == 'playwright' and num_workers > 1)
+    # Use async Playwright when multiple workers requested, or when a
+    # login_script is configured (the login plugin only runs in the
+    # async path).
+    auth = config.get('auth', {})
+    has_login_script = bool(auth.get('login_script', ''))
+    use_playwright_async = (driver_type == 'playwright'
+                            and (num_workers > 1 or has_login_script))
     if use_playwright_async:
         driver = None  # no sync browser — async sliding window creates its own
     else:
@@ -1312,7 +1318,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
         print("  Workers: {} (parallel)".format(num_workers))
 
     try:
-        if num_workers <= 1:
+        if num_workers <= 1 and not use_playwright_async:
             # --- Serial mode (original behavior, no thread overhead) ---
             while queue and page_count < max_pages and not interrupted:
                 url = queue.popleft()
@@ -1381,7 +1387,7 @@ def crawl_and_scan(start_url, max_pages=50, tags=None, rules=None, level=None,
                         inject_cookies_selenium(
                             driver, auth_cookies, start_url)
 
-        elif is_playwright and num_workers > 1:
+        elif use_playwright_async:
             # --- Playwright parallel: async sliding window ---
             # Instead of batching (which returns all at once), we maintain
             # a sliding window of N concurrent async tasks.  As each task
